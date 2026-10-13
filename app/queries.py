@@ -2,56 +2,99 @@
 
 Rule: every function that reads user-owned data takes `user_id` and filters on it
 in SQL. Never load a row by id and check ownership afterwards in Python.
+
+查询函数。
+规则：凡是读取"属于某个用户的数据"的函数，都必须接收 user_id 参数，并在 SQL 里按它过滤。
+绝不能先按 id 把数据查出来，再在 Python 里判断"是不是这个用户的"——
+那种写法在复杂查询里迟早会漏掉一处，造成越权（用户 A 看到用户 B 的数据）。
 """
 
+# dataclass：一个装饰器，能自动给类生成 __init__ 等方法，适合定义"只装数据的小类"
 from dataclasses import dataclass
+# datetime：用于类型标注
 from datetime import datetime
 
+# func：调用 SQL 函数（这里用 func.count()）
+# select：构造 SELECT 查询
+# true：SQL 里的布尔值 true（注意不是 Python 的 True）
 from sqlalchemy import func, select, true
+# Session：数据库会话的类型
+# aliased：给一个模型（或子查询）起"别名"，让同一个模型能在一条 SQL 里以不同身份出现
 from sqlalchemy.orm import Session, aliased
 
+# 导入要查询的模型
 from app.models import Conversation, Document, Message, UsageAction, UsageLog
 
 
+# 查询某个用户的文档列表（分页）
+# 参数：db 是数据库会话；user_id 是当前用户；limit 是每页条数；offset 是跳过前面多少条
+# 返回值类型 list[Document]：返回一个 Document 对象的列表
 def list_documents(db: Session, user_id: int, limit: int = 20, offset: int = 0) -> list[Document]:
+    # 用"链式调用"一步步构造查询语句。外层的括号只是为了能换行书写
     stmt = (
-        select(Document)
-        .where(Document.user_id == user_id)
+        select(Document)  # SELECT * FROM documents
+        .where(Document.user_id == user_id)  # WHERE user_id = ?  （权限过滤，必须有）
+        # ORDER BY created_at DESC, id DESC：新的在前
+        # 加上 id 是为了在创建时间相同时也有确定的顺序，否则翻页时可能重复或漏掉数据
         .order_by(Document.created_at.desc(), Document.id.desc())
-        .limit(limit)
-        .offset(offset)
+        .limit(limit)  # LIMIT 20：最多取 20 条
+        .offset(offset)  # OFFSET 0：跳过前 0 条（翻到第二页时传 20）
     )
+    # db.scalars(stmt) 执行查询，返回每行的第一列（这里就是 Document 对象）
+    # list(...) 把结果转成普通列表
     return list(db.scalars(stmt))
 
 
+# 按 id 查询单个文档。返回类型 Document | None：查到就返回文档，查不到返回 None
 def get_document(db: Session, user_id: int, document_id: int) -> Document | None:
-    """Returns None both for "doesn't exist" and "belongs to someone else"."""
+    """Returns None both for "doesn't exist" and "belongs to someone else".
+
+    "不存在"和"属于别人"都返回 None，调用方无法区分这两种情况。
+    这是故意的：如果对"属于别人"返回不同的错误，攻击者就能借此探测哪些 id 存在。
+    """
+    # WHERE id = ? AND user_id = ?：两个条件同时满足才返回
+    # 拿到别人的 document_id 也查不到，因为 user_id 对不上
     stmt = select(Document).where(Document.id == document_id, Document.user_id == user_id)
+    # db.scalar(stmt) 只取第一行第一列；没有结果时返回 None
     return db.scalar(stmt)
 
 
+# 按内容哈希查某个用户的文档：上传时用来判断"这个用户是不是已经传过同样的文件"
 def get_document_by_hash(db: Session, user_id: int, content_hash: str) -> Document | None:
+    # WHERE user_id = ? AND content_hash = ?
+    # 这两列正好有唯一约束 uq_documents_user_hash，查询会直接用上它的索引
     stmt = select(Document).where(Document.user_id == user_id, Document.content_hash == content_hash)
     return db.scalar(stmt)
 
 
+# 查询某个会话的全部消息
 def list_messages(db: Session, user_id: int, conversation_id: int) -> list[Message]:
-    """Messages of a conversation, oldest first. Empty if the conversation isn't the user's."""
+    """Messages of a conversation, oldest first. Empty if the conversation isn't the user's.
+
+    返回会话的消息，最早的在前。如果会话不属于这个用户，返回空列表。
+    """
     stmt = (
-        select(Message)
+        select(Message)  # SELECT messages.*
+        # messages 表里没有 user_id，所以要 JOIN（连接）conversations 表才能知道会话属于谁
+        # JOIN conversations ON messages.conversation_id = conversations.id
         .join(Conversation, Message.conversation_id == Conversation.id)
+        # WHERE conversations.id = ? AND conversations.user_id = ?（权限过滤）
         .where(Conversation.id == conversation_id, Conversation.user_id == user_id)
+        # ORDER BY created_at, id：按时间从早到晚排，时间相同再按 id 排
         .order_by(Message.created_at, Message.id)
     )
     return list(db.scalars(stmt))
 
 
+# @dataclass 会自动生成 __init__，所以可以直接写 ConversationSummary(会话, 消息)
+# 这个类用来装"一个会话 + 它的最后一条消息"
 @dataclass
 class ConversationSummary:
-    conversation: Conversation
-    last_message: Message | None
+    conversation: Conversation  # 会话对象
+    last_message: Message | None  # 最后一条消息；空会话没有消息，所以可能是 None
 
 
+# 查询会话列表，并带上每个会话的最后一条消息（类似聊天软件的会话列表页）
 def list_conversations_with_last_message(
     db: Session, user_id: int, limit: int = 20
 ) -> list[ConversationSummary]:
@@ -60,30 +103,58 @@ def list_conversations_with_last_message(
     The naive version loops over conversations and runs one "latest message" query
     per conversation. Here a LATERAL subquery picks the latest message per
     conversation, using the (conversation_id, created_at) index for each lookup.
+
+    只执行 1 条 SQL，而不是 1 + N 条。
+    朴素写法：先查出 N 个会话（1 条 SQL），再循环每个会话各查一次最后一条消息（N 条 SQL）。
+    这就是"N+1 问题"：会话越多，查询次数越多，越慢。
+    这里用 LATERAL 子查询，在一条 SQL 里为每个会话取出最新的一条消息，
+    每次查找都能用上 (conversation_id, created_at) 索引。
     """
+    # 第一步：构造子查询"某个会话的最后一条消息"
     last_msg = (
-        select(Message)
+        select(Message)  # SELECT messages.*
+        # 关键：这里引用了外层查询的 Conversation.id。
+        # 普通子查询不能引用外层查询的表，LATERAL 子查询可以。
+        # 效果是：对外层的每一个会话，都单独执行一次这个子查询
         .where(Message.conversation_id == Conversation.id)
+        # 按时间倒序，最新的在最前面
         .order_by(Message.created_at.desc(), Message.id.desc())
-        .limit(1)
-        .lateral("last_msg")
+        .limit(1)  # 只要第一条，也就是最新的那条
+        .lateral("last_msg")  # 把它标记为 LATERAL 子查询，别名叫 last_msg
     )
+    # 第二步：让子查询的结果能当作 Message 对象使用
+    # 这样查询结果里拿到的是 Message 对象，而不是一堆零散的列
     last_msg_entity = aliased(Message, last_msg)
+    # 第三步：构造主查询
     stmt = (
+        # 每行结果包含两样东西：会话对象、它的最后一条消息
         select(Conversation, last_msg_entity)
+        # LEFT OUTER JOIN LATERAL (...) ON true
+        # 用 LEFT（左连接）而不是普通 JOIN：没有消息的会话也要出现在结果里，此时消息为 None
+        # ON true：连接条件已经写在子查询的 where 里了，所以这里写"永远成立"
         .outerjoin(last_msg_entity, true())
+        # WHERE conversations.user_id = ?（权限过滤）
         .where(Conversation.user_id == user_id)
+        # 最近更新的会话排在前面
         .order_by(Conversation.updated_at.desc(), Conversation.id.desc())
-        .limit(limit)
+        .limit(limit)  # 最多取 limit 个会话
     )
+    # db.execute(stmt) 返回多行，每行是 (会话, 消息) 两个值
+    # 下面是"列表推导式"：遍历每一行，拆成 conv 和 msg，组装成 ConversationSummary
     return [ConversationSummary(conv, msg) for conv, msg in db.execute(stmt)]
 
 
+# 统计某个用户从某个时间点开始做了多少次某种操作（用来算今日配额）
 def count_actions_since(db: Session, user_id: int, action: UsageAction, since: datetime) -> int:
-    """Used for daily quota. Stage 4 replaces the hot path with a Redis counter."""
+    """Used for daily quota. Stage 4 replaces the hot path with a Redis counter.
+
+    用于每日配额。阶段 4 会把这个高频调用的地方换成 Redis 计数器，避免每次提问都查数据库。
+    """
+    # SELECT count(*) FROM usage_logs WHERE ...
     stmt = select(func.count()).where(
-        UsageLog.user_id == user_id,
-        UsageLog.action == action,
-        UsageLog.created_at >= since,
+        UsageLog.user_id == user_id,  # 是这个用户
+        UsageLog.action == action,  # 是这种操作（如 query）
+        UsageLog.created_at >= since,  # 在 since 之后（如今天零点之后）
     )
+    # 返回计数。"or 0" 是保险：万一结果是 None 就返回 0
     return db.scalar(stmt) or 0
