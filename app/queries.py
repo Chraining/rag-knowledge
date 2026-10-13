@@ -23,7 +23,29 @@ from sqlalchemy import func, select, true
 from sqlalchemy.orm import Session, aliased
 
 # 导入要查询的模型
-from app.models import Conversation, Document, Message, UsageAction, UsageLog
+from app.models import Conversation, Document, Message, UsageAction, UsageLog, User
+
+
+# ============================ 用户 ============================
+# 用户表的查询不需要 user_id 过滤：这些函数用在登录、注册阶段，此时还没有"当前用户"。
+
+
+# 按用户名查用户，登录时用。用户名已在注册时转成小写，所以这里也要传小写
+def get_user_by_username(db: Session, username: str) -> User | None:
+    # username 有唯一约束，自带索引，查询很快
+    return db.scalar(select(User).where(User.username == username))
+
+
+# 检查用户名或邮箱是否已被占用，注册时用
+def username_or_email_taken(db: Session, username: str, email: str) -> bool:
+    # SELECT id FROM users WHERE username = ? OR email = ? LIMIT 1
+    # 只要找到任意一行就说明被占用了，所以 LIMIT 1，不需要查出全部
+    stmt = select(User.id).where((User.username == username) | (User.email == email)).limit(1)
+    # 查到了返回 id（不是 None），否则返回 None
+    return db.scalar(stmt) is not None
+
+
+# ============================ 文档 ============================
 
 
 # 查询某个用户的文档列表（分页）

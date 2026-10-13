@@ -8,6 +8,8 @@ import pytest
 from alembic import command
 # Config：Alembic 的配置对象，对应 alembic.ini 文件
 from alembic.config import Config
+# TestClient：FastAPI 的测试客户端，不用真的启动服务器就能发 HTTP 请求
+from fastapi.testclient import TestClient
 # create_engine：创建数据库引擎；text：写原生 SQL
 from sqlalchemy import create_engine, text
 # Session：数据库会话
@@ -15,6 +17,10 @@ from sqlalchemy.orm import Session
 
 # 读取配置（拿测试数据库地址）
 from app.config import settings
+# get_db：要在测试里替换掉的依赖
+from app.db import get_db
+# FastAPI 应用
+from app.main import app
 # User 模型，造测试用户时用
 from app.models import User
 
@@ -98,3 +104,45 @@ def make_user(db):
 
     # 返回这个函数本身（注意没有括号，不是调用它）
     return _make
+
+
+# 测试客户端：用它给应用发请求，就像真实的前端一样
+# monkeypatch：pytest 自带的 fixture，用来临时修改属性，测试结束后自动恢复
+# tmp_path：pytest 自带的 fixture，每个测试一个全新的临时目录，测试结束后自动清理
+@pytest.fixture
+def client(db, monkeypatch, tmp_path):
+    # 把上传文件的存储目录改成临时目录，测试不会往项目的 storage/ 里写文件
+    monkeypatch.setattr(settings, "storage_dir", str(tmp_path))
+
+    # 替换掉 get_db 依赖：让接口使用测试的 db 会话（在会被回滚的事务里），而不是连开发数据库
+    def override_get_db():
+        yield db
+
+    # dependency_overrides：FastAPI 提供的机制，测试时把某个依赖换成另一个函数
+    app.dependency_overrides[get_db] = override_get_db
+    # with 块：启动和关闭测试客户端
+    with TestClient(app) as c:
+        yield c
+    # 测试结束后清除替换，避免影响别的测试
+    app.dependency_overrides.clear()
+
+
+# 工厂 fixture：通过真实的接口注册并登录一个用户，返回带 token 的请求头
+# 用法：headers = register_and_login("alice")，之后 client.get(..., headers=headers)
+@pytest.fixture
+def register_and_login(client):
+    def _register_and_login(username: str, password: str = "password123") -> dict[str, str]:
+        # 调用注册接口
+        r = client.post(
+            "/auth/register",
+            json={"username": username, "email": f"{username}@example.com", "password": password},
+        )
+        # 注册必须成功，否则后面的测试没意义。assert 后面的 r.text 是失败时显示的信息
+        assert r.status_code == 201, r.text
+        # 调用登录接口。登录用的是表单格式（data=），不是 JSON（json=）
+        r = client.post("/auth/login", data={"username": username, "password": password})
+        assert r.status_code == 200, r.text
+        # 返回请求头：Authorization: Bearer <token>
+        return {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+    return _register_and_login
