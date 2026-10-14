@@ -35,4 +35,11 @@ celery_app.conf.update(
     task_ignore_result=True,
     # worker 启动时如果连不上 broker，自动重试，而不是直接退出
     broker_connection_retry_on_startup=True,
+    # 下面两项控制"Redis 挂了时，上传接口里的 .delay() 要卡多久才放弃"。
+    # 默认设置下实测要卡 20 秒，用户的上传请求就一直转圈。
+    # 投递失败的文档会停在 pending，由 scripts/requeue_pending.py 补投，所以没必要在请求里久等。
+    # 连接 Redis 最多等 1 秒
+    broker_transport_options={"socket_connect_timeout": 1},
+    # 投递失败不重试。实测：Redis 重启后，旧连接断了，Celery 仍会自动建立新连接，投递照样成功
+    task_publish_retry_policy={"max_retries": 0},
 )

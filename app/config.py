@@ -42,7 +42,9 @@ class Settings(BaseSettings):
     # ---------- 后台任务（Celery） ----------
     # 消息队列（broker）的地址：上传接口把"请处理文档 X"的消息放进 Redis，worker 从这里取
     # 格式：redis://主机:端口/库编号。Redis 默认有 16 个库（0-15），这里用 0 号
-    celery_broker_url: str = "redis://localhost:6379/0"
+    # 写 127.0.0.1 而不是 localhost：Windows 会把 localhost 先解析成 IPv6 的 ::1，
+    # 而 Docker 里的 Redis 只监听 IPv4，每次新建连接都要白等约 2 秒才退回到 IPv4（实测）
+    celery_broker_url: str = "redis://127.0.0.1:6379/0"
 
 
 # 在模块加载时创建一个全局唯一的配置对象
