@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["chat"])
 
 # 检索不到任何相关段落时的固定回答。这种情况下不调用 LLM：反正它也只能说"没找到"，还要花钱
-NO_CONTEXT_ANSWER = "在你的文档里没有找到相关内容。请先上传文档，或等文档处理完成（状态变为 ready）后再提问。"
+NO_CONTEXT_ANSWER = "在你的文档里没有找到相关内容。如果刚上传了文档，请等它处理完成（状态变为 ready）后再提问。"
 # 会话标题最多取问题的前 50 个字符
 TITLE_LENGTH = 50
 # 来源里展示段落开头的多少个字符
@@ -66,6 +66,8 @@ def chat(body: ChatRequest, user: CurrentUser, db: DbSession) -> ChatResponse:
         history = queries.list_messages(db, user.id, conversation.id) if conversation else []
         # 问题 → 向量 → 检索
         chunks = queries.search_chunks(db, user.id, rag.embed_query(body.question), settings.retrieval_top_k)
+        # 去掉相似度太低的段落。向量检索总会返回 top_k 个"最近的"，哪怕它们其实毫不相关
+        chunks = [c for c in chunks if c.score >= settings.retrieval_min_score]
         # 结束当前的只读事务，把数据库连接还给连接池。
         # 原因：下面调用 LLM 可能要十几秒，这期间如果一直占着连接（"idle in transaction"），
         # 并发一高，连接池很快就被占满，其他所有接口都要排队等连接

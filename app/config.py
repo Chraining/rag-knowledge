@@ -69,6 +69,10 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 30
     # 每次提问检索多少段最相关的文字交给 LLM
     retrieval_top_k: int = 5
+    # 最低相似度：低于它的段落当作"不相关"丢掉，不发给 LLM，也不显示为来源。
+    # 0.3 是根据 text-embedding-v4 的实测定的：相关段落约 0.55-0.67，无关段落约 0.12-0.19。
+    # 换了 embedding 模型，这个值要重新测
+    retrieval_min_score: float = 0.3
 
 
 # 在模块加载时创建一个全局唯一的配置对象

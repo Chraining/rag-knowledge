@@ -61,8 +61,9 @@ def test_search_returns_most_similar_first(client, db, register_and_login, enque
 def test_search_never_returns_other_users_chunks(client, db, register_and_login, enqueued):
     alice, bob = register_and_login("alice"), register_and_login("bob")
     add_ready_doc(client, db, bob, enqueued, "secret.md", "bob salary is 50000")
-    add_ready_doc(client, db, alice, enqueued, "notes.md", "alice likes tea")
-    r = ask(client, alice, "bob salary is 50000")
+    add_ready_doc(client, db, alice, enqueued, "notes.md", "salary notes")
+    # 这个问题和 bob 的文档也有一定相似度（高于最低分数线），如果没有权限过滤，bob 的文档会出现在来源里
+    r = ask(client, alice, "salary notes")
     assert [s["filename"] for s in r.json()["sources"]] == ["notes.md"]
 
 
@@ -104,7 +105,8 @@ def test_follow_up_sends_history(client, db, register_and_login, enqueued, fake_
     headers = register_and_login("alice")
     add_ready_doc(client, db, headers, enqueued, "tea.md", "green tea comes from china")
     conversation_id = ask(client, headers, "where does green tea come from?").json()["conversation_id"]
-    ask(client, headers, "and black tea?", conversation_id)
+    # 追问要和文档有足够多相同的词，否则相似度低于分数线，不会调用 LLM
+    ask(client, headers, "where does black tea come from?", conversation_id)
     second_call = fake_llm.chat_calls[1]
     # 消息顺序：系统提示词、上一轮的提问、上一轮的回答、这次的问题
     assert [m["role"] for m in second_call] == ["system", "user", "assistant", "user"]
@@ -123,11 +125,24 @@ def test_cannot_use_other_users_conversation(client, db, register_and_login, enq
     assert client.delete(f"/conversations/{bobs_conversation}", headers=alice).status_code == 404
 
 
+# 测试：相似度低于分数线的段落不算来源；全都不相关时，直接返回固定回答，不调用 LLM
+def test_irrelevant_chunks_are_dropped(client, db, register_and_login, enqueued, fake_llm):
+    headers = register_and_login("alice")
+    add_ready_doc(client, db, headers, enqueued, "tea.md", "green tea comes from china")
+    add_ready_doc(client, db, headers, enqueued, "car.md", "change engine oil every 5000 km")
+    r = ask(client, headers, "where does green tea come from")
+    assert [s["filename"] for s in r.json()["sources"]] == ["tea.md"]
+    r = ask(client, headers, "what is the python gil")
+    assert r.json()["sources"] == []
+    # 只有第一个问题调用了 LLM
+    assert len(fake_llm.chat_calls) == 1
+
+
 # 测试：没有可检索的文档时，直接返回固定回答，不调用 LLM（省钱）
 def test_no_documents_skips_llm(client, register_and_login, fake_llm):
     headers = register_and_login("alice")
     r = ask(client, headers, "anything?")
-    assert r.json()["answer"] == "在你的文档里没有找到相关内容。请先上传文档，或等文档处理完成（状态变为 ready）后再提问。"
+    assert r.json()["answer"] == "在你的文档里没有找到相关内容。如果刚上传了文档，请等它处理完成（状态变为 ready）后再提问。"
     assert fake_llm.chat_calls == []
 
 
