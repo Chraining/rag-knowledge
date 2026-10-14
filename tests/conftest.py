@@ -2,6 +2,12 @@
 # fixture（测试夹具）= 测试运行前的"准备工作"，比如连好数据库、造好测试用户。
 # 测试函数只要在参数里写上 fixture 的名字（如 db），pytest 就会自动把准备好的东西传进来。
 
+# hashlib、re：假 embedding 里用来切词和哈希
+import hashlib
+import re
+
+# fakeredis：在内存里模拟 Redis 的库
+import fakeredis
 # pytest：测试框架
 import pytest
 # command：Alembic 的命令接口，可以在代码里执行"alembic upgrade head"
@@ -21,8 +27,10 @@ from app.config import settings
 from app.db import get_db
 # FastAPI 应用
 from app.main import app
-# User 模型，造测试用户时用
-from app.models import User
+# User 模型，造测试用户时用；EMBEDDING_DIM：向量维度
+from app.models import EMBEDDING_DIM, User
+# 要被替换成假对象的两个模块
+from app import llm, redis_client
 
 
 # scope="session"：整个测试过程只执行一次（而不是每个测试都执行一次），因为建表比较慢
@@ -124,6 +132,59 @@ def enqueued(monkeypatch):
     # 替换 documents 路由模块里的 process_document（它在 import 时就绑定到了模块的变量上）
     monkeypatch.setattr("app.routers.documents.process_document", FakeTask)
     return calls
+
+
+# 假的 embedding：把文字里的每个单词"哈希"到 1024 维中的某一维上，在那一维上加 1。
+# 效果：包含相同单词的文字，向量方向接近，余弦相似度高。足够测试"检索能找到相关段落"，而且结果固定、不花钱
+def fake_embedding(text: str) -> list[float]:
+    vector = [0.0] * EMBEDDING_DIM
+    # 最后一维固定一个很小的值，保证向量不全是 0（全 0 向量没有方向，余弦距离算不出来）
+    vector[-1] = 0.01
+    # \w+ 匹配连续的字母、数字、汉字，相当于按空格和标点切词
+    for word in re.findall(r"\w+", text.lower()):
+        # md5 得到一个固定的大整数，对 1023 取余，落到 0-1022 中的某一维
+        vector[int(hashlib.md5(word.encode()).hexdigest(), 16) % (EMBEDDING_DIM - 1)] += 1.0
+    return vector
+
+
+# 假的 AI 服务：记录每次调用，可以设置成"失败模式"
+class FakeLLM:
+    def __init__(self):
+        self.embedded: list[str] = []  # 被转换成向量的所有文字
+        self.chat_calls: list[list[dict]] = []  # 每次 chat 调用收到的消息
+        self.fail = False  # 设成 True 后，所有调用都抛 LLMUnavailable，模拟服务挂了
+        self.answer = "fake answer"  # chat 返回的固定回答
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        if self.fail:
+            raise llm.LLMUnavailable("fake outage")
+        self.embedded.extend(texts)
+        return [fake_embedding(t) for t in texts]
+
+    def chat(self, messages: list[dict]) -> tuple[str, int]:
+        if self.fail:
+            raise llm.LLMUnavailable("fake outage")
+        self.chat_calls.append(messages)
+        return self.answer, 42  # 固定返回 42 个 token
+
+
+# 每个测试自动把真正的 AI 服务换成假的：测试不联网、不花钱、结果固定。
+# 测试里写参数 fake_llm 就能拿到它，检查调用记录或者设置失败模式
+@pytest.fixture(autouse=True)
+def fake_llm(monkeypatch):
+    fake = FakeLLM()
+    monkeypatch.setattr(llm, "embed_texts", fake.embed_texts)
+    monkeypatch.setattr(llm, "chat", fake.chat)
+    return fake
+
+
+# 每个测试自动把 Redis 换成 fakeredis：在内存里模拟 Redis，测试之间互不影响，也不需要真的 Redis。
+# 返回 FakeServer：测试里把 server.connected 设成 False，就能模拟"Redis 挂了"
+@pytest.fixture(autouse=True)
+def fake_redis(monkeypatch):
+    server = fakeredis.FakeServer()
+    monkeypatch.setattr(redis_client, "client", fakeredis.FakeRedis(server=server))
+    return server
 
 
 # 测试客户端：用它给应用发请求，就像真实的前端一样

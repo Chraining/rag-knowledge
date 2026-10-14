@@ -17,13 +17,22 @@ from datetime import datetime
 # func：调用 SQL 函数（这里用 func.count()）
 # select：构造 SELECT 查询
 # true：SQL 里的布尔值 true（注意不是 Python 的 True）
-from sqlalchemy import func, select, true
+from sqlalchemy import func, select, text, true
 # Session：数据库会话的类型
 # aliased：给一个模型（或子查询）起"别名"，让同一个模型能在一条 SQL 里以不同身份出现
 from sqlalchemy.orm import Session, aliased
 
 # 导入要查询的模型
-from app.models import Conversation, Document, Message, UsageAction, UsageLog, User
+from app.models import (
+    Chunk,
+    Conversation,
+    Document,
+    DocumentStatus,
+    Message,
+    UsageAction,
+    UsageLog,
+    User,
+)
 
 
 # ============================ 用户 ============================
@@ -86,6 +95,12 @@ def get_document_by_hash(db: Session, user_id: int, content_hash: str) -> Docume
     # WHERE user_id = ? AND content_hash = ?
     # 这两列正好有唯一约束 uq_documents_user_hash，查询会直接用上它的索引
     stmt = select(Document).where(Document.user_id == user_id, Document.content_hash == content_hash)
+    return db.scalar(stmt)
+
+
+# 按 id 查询某个用户的会话。不存在或属于别人，都返回 None（和 get_document 的理由一样）
+def get_conversation(db: Session, user_id: int, conversation_id: int) -> Conversation | None:
+    stmt = select(Conversation).where(Conversation.id == conversation_id, Conversation.user_id == user_id)
     return db.scalar(stmt)
 
 
@@ -180,3 +195,47 @@ def count_actions_since(db: Session, user_id: int, action: UsageAction, since: d
     )
     # 返回计数。"or 0" 是保险：万一结果是 None 就返回 0
     return db.scalar(stmt) or 0
+
+
+# ============================ 检索 ============================
+
+
+# 检索结果中的一段
+@dataclass
+class RetrievedChunk:
+    chunk_id: int  # 段落 id
+    document_id: int  # 所属文档 id
+    filename: str  # 所属文档的文件名，展示来源时用
+    content: str  # 段落内容，拼进给 LLM 的提示词里
+    score: float  # 相似度，1 表示完全相同，越小越不相关
+
+
+# 向量检索：在这个用户"已处理完成"的文档里，找出和问题向量最相似的 top_k 段
+def search_chunks(db: Session, user_id: int, query_vector: list[float], top_k: int) -> list[RetrievedChunk]:
+    # 多用户场景下 HNSW 索引的一个坑：
+    #   索引是所有用户共用的。默认情况下，索引只先找出全局最相似的 40 个段落，再按 WHERE 条件过滤。
+    #   如果这 40 个都是别人的，过滤完一个都不剩，这个用户就搜不到任何结果，哪怕他的文档里有答案。
+    # iterative_scan（pgvector 0.8 的新功能）：过滤后不够 top_k 个时，继续在索引里往下找，直到够数。
+    # strict_order：保证结果严格按距离排序。
+    # SET LOCAL：只在当前事务里生效，事务结束后自动恢复，不影响连接池里这个连接的下一次使用
+    db.execute(text("SET LOCAL hnsw.iterative_scan = strict_order"))
+    # 余弦距离：0 表示方向完全相同，越大越不相似。用 .label 给这个计算结果起个名字
+    distance = Chunk.embedding.cosine_distance(query_vector).label("distance")
+    stmt = (
+        select(Chunk.id, Chunk.document_id, Document.filename, Chunk.content, distance)
+        # chunks 表没有 user_id，要连接 documents 表才知道段落属于谁
+        .join(Document, Chunk.document_id == Document.id)
+        .where(
+            Document.user_id == user_id,  # 权限过滤：只搜自己的文档
+            Document.status == DocumentStatus.READY,  # 只搜处理完成的文档
+            Chunk.embedding.is_not(None),  # 跳过没有向量的段落
+        )
+        # 按距离从小到大排序，也就是最相似的在前
+        .order_by(distance)
+        .limit(top_k)
+    )
+    return [
+        # 相似度 = 1 - 余弦距离，更直观：越大越相似
+        RetrievedChunk(chunk_id, document_id, filename, content, 1 - dist)
+        for chunk_id, document_id, filename, content, dist in db.execute(stmt)
+    ]

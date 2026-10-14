@@ -7,8 +7,8 @@
 # FastAPI：Web 框架
 from fastapi import FastAPI
 
-# 导入两个路由模块
-from app.routers import auth, documents
+# 导入各个路由模块
+from app.routers import auth, chat, conversations, documents
 
 # 创建应用。title 会显示在 Swagger 页面顶部
 app = FastAPI(title="RAG Knowledge Base")
@@ -16,3 +16,5 @@ app = FastAPI(title="RAG Knowledge Base")
 # 把路由挂到应用上。之后 /auth/... 和 /documents/... 的请求就会交给对应的函数处理
 app.include_router(auth.router)
 app.include_router(documents.router)
+app.include_router(chat.router)
+app.include_router(conversations.router)

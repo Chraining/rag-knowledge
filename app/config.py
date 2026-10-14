@@ -16,9 +16,9 @@ class Settings(BaseSettings):
     # 开发用数据库的连接地址。格式：方言+驱动://用户名:密码@主机:端口/数据库名
     # postgresql+psycopg 表示"PostgreSQL 数据库，用 psycopg 驱动连接"
     # 等号后面是默认值：.env 里没写时才用它
-    database_url: str = "postgresql+psycopg://rag:rag@localhost:5432/rag"
+    database_url: str = "postgresql+psycopg://rag:rag@127.0.0.1:5433/rag"
     # 测试专用数据库，和开发库分开，跑测试时不会弄乱开发数据
-    test_database_url: str = "postgresql+psycopg://rag:rag@localhost:5432/rag_test"
+    test_database_url: str = "postgresql+psycopg://rag:rag@127.0.0.1:5433/rag_test"
     # 新用户默认每天能提问的次数（对应 users.daily_quota 的默认值）
     default_daily_quota: int = 50
 
@@ -45,6 +45,24 @@ class Settings(BaseSettings):
     # 写 127.0.0.1 而不是 localhost：Windows 会把 localhost 先解析成 IPv6 的 ::1，
     # 而 Docker 里的 Redis 只监听 IPv4，每次新建连接都要白等约 2 秒才退回到 IPv4（实测）
     celery_broker_url: str = "redis://127.0.0.1:6379/0"
+
+    # ---------- Redis（配额计数、缓存） ----------
+    # 和 Celery 用同一个 Redis，但用 1 号库，和任务队列的数据分开，互不干扰
+    redis_url: str = "redis://127.0.0.1:6379/1"
+
+    # ---------- LLM 和 embedding（阿里云百炼 DashScope） ----------
+    # API key：在阿里云百炼控制台创建，写进 .env 的 DASHSCOPE_API_KEY。绝不能提交到 git
+    dashscope_api_key: str = ""
+    # DashScope 的"OpenAI 兼容"接口地址，所以可以直接用 openai 这个 Python 库调用它
+    llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    # 生成回答用的模型
+    chat_model: str = "qwen-plus"
+    # 把文字转换成向量的模型
+    embedding_model: str = "text-embedding-v4"
+    # 一次调用最多等多少秒。超时就当作失败，不让用户的请求一直卡着
+    llm_timeout_seconds: float = 30
+    # 每次提问检索多少段最相关的文字交给 LLM
+    retrieval_top_k: int = 5
 
 
 # 在模块加载时创建一个全局唯一的配置对象

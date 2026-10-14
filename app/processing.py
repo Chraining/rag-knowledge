@@ -1,8 +1,7 @@
-# 文档处理的核心逻辑：读文件 → 提取文本 → 切分 → 写入 chunks → 更新状态。
+# 文档处理的核心逻辑：读文件 → 提取文本 → 切分 → 生成向量 → 写入 chunks → 更新状态。
 # 这里的函数都接收一个数据库会话（db）作为参数，不关心自己是被谁调用的：
 #   - 后台任务（tasks.py）调用它们时，传入连接开发数据库的会话
 #   - 测试调用它们时，传入连接测试数据库的会话
-# 向量化（embedding）放在阶段 4，和向量列一起加。
 #
 # 状态机（只允许这几种变化）：
 #   pending ──> processing ──> ready
@@ -33,6 +32,8 @@ from sqlalchemy import delete, select, update
 # Session：数据库会话的类型
 from sqlalchemy.orm import Session
 
+# 调用 embedding 服务。写成 from app import llm 再用 llm.embed_texts，测试才能把它替换成假的
+from app import llm
 # 模型
 from app.models import Chunk, Document, DocumentStatus
 # 读取磁盘上的文件
@@ -115,7 +116,7 @@ def start_processing(db: Session, document_id: int) -> Document | None:
 
 
 # 第二步（不碰数据库）：读文件、校验、提取文字、切分。这是最耗时的部分，所以放在事务外面，
-# 避免长时间锁住数据库的行。阶段 4 的 embedding（调外部 API，可能要几十秒）也会放在这一步
+# 避免长时间锁住数据库的行
 def read_and_split(doc: Document) -> list[str]:
     try:
         content = read_file(doc.storage_path)
@@ -135,8 +136,8 @@ def read_and_split(doc: Document) -> list[str]:
     return chunks
 
 
-# 第三步（事务 2）：写入 chunks，状态改成 ready。返回 True 表示这次写入了，False 表示跳过了
-def save_chunks(db: Session, document_id: int, chunks: list[str]) -> bool:
+# 第三步（事务 2）：写入 chunks 和它们的向量，状态改成 ready。返回 True 表示这次写入了，False 表示跳过了
+def save_chunks(db: Session, document_id: int, chunks: list[str], vectors: list[list[float]]) -> bool:
     # 再次锁住文档这一行。第一步的锁在 commit 时已经释放了，这里必须重新锁：
     # 如果两个任务同时走到这里，第二个会等第一个提交，然后看到状态已经是 ready，直接跳过
     doc = db.scalar(select(Document).where(Document.id == document_id).with_for_update())
@@ -146,8 +147,11 @@ def save_chunks(db: Session, document_id: int, chunks: list[str]) -> bool:
         return False
     # 删掉这个文档的旧 chunks（如果有的话），保证不会重复
     db.execute(delete(Chunk).where(Chunk.document_id == document_id))
-    # 批量添加新的 chunks。enumerate 同时给出序号 i（从 0 开始）和内容 text
-    db.add_all(Chunk(document_id=document_id, chunk_index=i, content=text) for i, text in enumerate(chunks))
+    # 批量添加新的 chunks。zip 把每段文字和它的向量配成一对；enumerate 再给每一对加上序号 i（从 0 开始）
+    db.add_all(
+        Chunk(document_id=document_id, chunk_index=i, content=text, embedding=vector)
+        for i, (text, vector) in enumerate(zip(chunks, vectors, strict=True))
+    )
     # 更新文档的状态和统计信息
     doc.status = DocumentStatus.READY
     doc.chunk_count = len(chunks)
@@ -178,4 +182,8 @@ def process_document(db: Session, document_id: int) -> None:
     if doc is None:
         return
     chunks = read_and_split(doc)
-    save_chunks(db, document_id, chunks)
+    # 调用 embedding 服务把每段文字转成向量。这是整个流程里最慢的一步（网络调用），
+    # 所以和读文件一样放在两个事务之间，不占着数据库的锁。
+    # 失败时抛出 LLMUnavailable，属于"临时性错误"，tasks.py 会让 Celery 过一会儿重试
+    vectors = llm.embed_texts(chunks)
+    save_chunks(db, document_id, chunks, vectors)

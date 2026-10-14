@@ -23,6 +23,8 @@ from sqlalchemy import (
     UniqueConstraint,  # 唯一约束：某一列（或几列组合）的值不能重复
     func,  # 用来调用数据库里的函数，例如 func.now() 就是 SQL 的 now()
 )
+# Vector：pgvector 扩展提供的向量列类型，用来存 embedding（一串浮点数）
+from pgvector.sqlalchemy import Vector
 # JSONB：PostgreSQL 特有的 JSON 类型（二进制存储，可以建索引、可以查询内部字段）
 from sqlalchemy.dialects.postgresql import JSONB
 # DeclarativeBase：所有模型类的基类
@@ -33,6 +35,11 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 # 导入配置，用来拿默认每日配额
 from app.config import settings
+
+
+# 向量的维度：每段文字被 embedding 模型转换成 1024 个浮点数。
+# 必须和 embedding 模型输出的维度一致（text-embedding-v4 调用时指定 dimensions=1024）
+EMBEDDING_DIM = 1024
 
 
 # 所有模型的基类。继承它的类会被 SQLAlchemy 识别为一张表。
@@ -185,6 +192,16 @@ class Chunk(Base):
         # 作用 2：唯一约束会自带一个索引，且以 document_id 开头，
         #        所以"查某文档的所有段"也能用上它，不需要再单独给 document_id 建索引
         UniqueConstraint("document_id", "chunk_index", name="uq_chunks_document_index"),
+        # HNSW 向量索引：加速"找出和问题向量最相似的段落"。
+        # 没有它，每次提问都要和所有段落逐个计算距离（全表扫描）；
+        # 有了它，像查地图一样只看"附近"的点，代价是结果是近似的（偶尔漏掉一个真正最近的）。
+        # vector_cosine_ops：按余弦距离建索引，必须和查询里用的距离函数（cosine_distance）一致，否则用不上索引
+        Index(
+            "ix_chunks_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
     )
 
     # 主键
@@ -198,9 +215,10 @@ class Chunk(Base):
     chunk_index: Mapped[int] = mapped_column(Integer)
     # 这一段的文本内容
     content: Mapped[str] = mapped_column(Text)
-    # The embedding column is added in stage 4, together with the choice of
-    # pgvector vs. a separate vector database.
-    # 向量列在阶段 4 再加，到时候一起决定用 pgvector 还是独立的向量数据库
+    # 这一段文字的向量（embedding）。语义相近的文字，向量之间的距离也近。
+    # 允许为空的原因：给一张已经有数据的表加新列时，旧的行没有值。
+    # 正常流程里，worker 写入段落时一定会同时写入向量
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIM))
 
     # 关系：chunk.document 拿到所属文档
     document: Mapped[Document] = relationship(back_populates="chunks")

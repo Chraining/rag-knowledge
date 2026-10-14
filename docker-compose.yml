@@ -1,0 +1,36 @@
+# 开发环境依赖的服务：PostgreSQL（带 pgvector 扩展）和 Redis。
+# 启动：docker compose up -d      停止：docker compose stop
+# 应用本身和 worker 仍然在本机用 uv run 启动；阶段 5 会把它们也加进来。
+services:
+  postgres:
+    # 官方 PostgreSQL 18 镜像 + 预装好的 pgvector 扩展
+    image: pgvector/pgvector:pg18
+    environment:
+      POSTGRES_USER: rag  # 用户名
+      POSTGRES_PASSWORD: rag  # 密码（只用于本机开发）
+      POSTGRES_DB: rag  # 自动创建的开发库
+    ports:
+      # 只绑定 127.0.0.1：只有本机能连，局域网里的其他机器连不上。
+      # 用 5433 而不是 5432：5432 已经被你本机安装的 PostgreSQL 占用了
+      - "127.0.0.1:5433:5432"
+    volumes:
+      # 数据存在 Docker 卷里，删掉容器数据也还在。PG18 镜像要求挂载到 /var/lib/postgresql
+      - pgdata:/var/lib/postgresql
+      # 第一次启动时执行的建库脚本
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    restart: unless-stopped  # Docker 启动时自动启动，除非手动停止过
+
+  redis:
+    image: redis:7-alpine
+    # --appendonly yes：把每次写操作记到磁盘上，重启后队列里的任务不会丢
+    command: redis-server --appendonly yes
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redisdata:/data
+    restart: unless-stopped
+
+# 上面用到的两个数据卷
+volumes:
+  pgdata:
+  redisdata:

@@ -360,3 +360,14 @@ def test_progress_visible_through_api(client, db, register_and_login, enqueued):
     body = client.get(f"/documents/{doc_id}", headers=headers).json()
     assert body["status"] == "ready"
     assert body["chunk_count"] == 1
+
+
+# 测试：embedding 服务挂了属于临时性错误，任务会重试；一直挂着就在重试用完后标记为失败
+def test_embedding_outage_is_retried_then_fails(task_db, make_document, fake_llm):
+    doc = make_document(b"content")
+    fake_llm.fail = True
+    tasks.process_document.apply(args=[doc.id])
+    task_db.refresh(doc)
+    assert doc.status == DocumentStatus.FAILED
+    assert "Failed after 3 retries" in doc.error_message
+    assert "LLMUnavailable" in doc.error_message

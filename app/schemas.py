@@ -19,7 +19,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 # 文档状态枚举，复用数据库模型里的定义
-from app.models import DocumentStatus
+from app.models import DocumentStatus, MessageRole
 
 
 # ============================ 用户 ============================
@@ -84,3 +84,52 @@ class DocumentOut(BaseModel):
     processed_at: datetime | None
     # 注意：没有 storage_path。服务器上的文件路径是内部细节，暴露给前端没有好处，
     # 反而会泄露服务器的目录结构
+
+
+# ============================ 问答 ============================
+
+
+# 请求体：POST /chat
+class ChatRequest(BaseModel):
+    # 问题，1 到 2000 个字符。限制长度：太长的问题会让提示词变得很长，费用和延迟都增加
+    question: str = Field(min_length=1, max_length=2000)
+    # 接着哪个会话继续问。不传（None）就新建一个会话
+    conversation_id: int | None = None
+
+
+# 回答引用的一个来源
+class SourceOut(BaseModel):
+    chunk_id: int  # 段落 id
+    document_id: int  # 文档 id
+    filename: str  # 文件名
+    score: float  # 相似度，越接近 1 越相关
+    snippet: str  # 段落开头的一部分，方便用户看出引用的是哪里
+
+
+# 响应体：POST /chat
+class ChatResponse(BaseModel):
+    conversation_id: int  # 会话 id，追问时传回来
+    answer: str  # 回答
+    sources: list[SourceOut]  # 引用来源
+
+
+# 一条消息
+class MessageOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    role: MessageRole  # user 或 assistant
+    content: str
+    # 引用来源（只有 assistant 消息有）。格式：[{"chunk_id": 1, "document_id": 2, "score": 0.83}, ...]
+    sources: list[dict] | None
+    created_at: datetime
+
+
+# 会话列表中的一项：会话信息 + 最后一条消息
+class ConversationOut(BaseModel):
+    id: int
+    title: str
+    created_at: datetime
+    updated_at: datetime
+    last_message: MessageOut | None  # 空会话没有消息
+
