@@ -1,6 +1,6 @@
-# 调用外部 AI 服务：把文字转成向量（embedding）、让大模型生成回答（chat）。
-# 用的是阿里云百炼 DashScope 的"OpenAI 兼容"接口，所以可以直接用 openai 这个库，
-# 以后想换成别家（DeepSeek、硅基流动等兼容 OpenAI 接口的服务），只需要改 .env 里的地址和模型名。
+# 调用外部 AI 服务：把文字转成向量（embedding，阿里云百炼）、让大模型生成回答（chat，DeepSeek）。
+# 两家都提供"OpenAI 兼容"接口，所以都直接用 openai 这个库，
+# 以后想换成别家（通义千问、硅基流动等兼容 OpenAI 接口的服务），只需要改 .env 里的地址、key 和模型名。
 #
 # 外部服务一定会出问题（超时、限流、宕机），这里的应对：
 #   1. 超时：每次调用最多等 llm_timeout_seconds 秒
@@ -28,12 +28,13 @@ class LLMUnavailable(Exception):
 
 # 创建客户端。每次调用时创建，而不是在模块加载时创建一个全局的：
 #   没配 API key 时，导入这个模块不会报错（测试和 worker 启动都不受影响），只有真正调用时才报错
-def _client() -> OpenAI:
-    if not settings.dashscope_api_key:
-        raise LLMUnavailable("DASHSCOPE_API_KEY is not set in .env")
+# 参数：api_key 是密钥；base_url 是服务地址；key_name 是 .env 里的变量名，只用于报错信息
+def _client(api_key: str, base_url: str, key_name: str) -> OpenAI:
+    if not api_key:
+        raise LLMUnavailable(f"{key_name} is not set in .env")
     return OpenAI(
-        api_key=settings.dashscope_api_key,
-        base_url=settings.llm_base_url,
+        api_key=api_key,
+        base_url=base_url,
         timeout=settings.llm_timeout_seconds,  # 超时秒数
         max_retries=2,  # 自动重试次数
     )
@@ -41,7 +42,8 @@ def _client() -> OpenAI:
 
 # 把多段文字转换成向量，返回的顺序和输入的顺序一一对应
 def embed_texts(texts: list[str]) -> list[list[float]]:
-    client = _client()
+    # embedding 用阿里云百炼
+    client = _client(settings.dashscope_api_key, settings.embedding_base_url, "DASHSCOPE_API_KEY")
     vectors: list[list[float]] = []
     try:
         # 每 10 段发一次请求
@@ -62,7 +64,8 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
 # 让大模型根据对话消息生成回答。返回 (回答内容, 消耗的 token 数)
 # messages 的格式：[{"role": "system"/"user"/"assistant", "content": "..."}, ...]
 def chat(messages: list[dict[str, str]]) -> tuple[str, int]:
-    client = _client()
+    # 回答用 DeepSeek
+    client = _client(settings.deepseek_api_key, settings.chat_base_url, "DEEPSEEK_API_KEY")
     try:
         response = client.chat.completions.create(model=settings.chat_model, messages=messages)
     except OpenAIError as e:

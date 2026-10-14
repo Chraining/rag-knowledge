@@ -50,14 +50,20 @@ class Settings(BaseSettings):
     # 和 Celery 用同一个 Redis，但用 1 号库，和任务队列的数据分开，互不干扰
     redis_url: str = "redis://127.0.0.1:6379/1"
 
-    # ---------- LLM 和 embedding（阿里云百炼 DashScope） ----------
-    # API key：在阿里云百炼控制台创建，写进 .env 的 DASHSCOPE_API_KEY。绝不能提交到 git
+    # ---------- LLM 和 embedding ----------
+    # 两家服务都提供"OpenAI 兼容"接口，所以都用 openai 这个 Python 库调用，只是地址、key、模型名不同。
+    # API key 都写进 .env，绝不能提交到 git
+
+    # 生成回答：DeepSeek。key 在 platform.deepseek.com 创建，写进 .env 的 DEEPSEEK_API_KEY
+    deepseek_api_key: str = ""
+    chat_base_url: str = "https://api.deepseek.com"
+    # deepseek-chat：DeepSeek 的普通对话模型（不带"深度思考"，回答快、便宜）
+    chat_model: str = "deepseek-chat"
+
+    # 文字转向量：阿里云百炼 DashScope（DeepSeek 没有 embedding 接口）。
+    # key 在百炼控制台创建，写进 .env 的 DASHSCOPE_API_KEY
     dashscope_api_key: str = ""
-    # DashScope 的"OpenAI 兼容"接口地址，所以可以直接用 openai 这个 Python 库调用它
-    llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    # 生成回答用的模型
-    chat_model: str = "qwen-plus"
-    # 把文字转换成向量的模型
+    embedding_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     embedding_model: str = "text-embedding-v4"
     # 一次调用最多等多少秒。超时就当作失败，不让用户的请求一直卡着
     llm_timeout_seconds: float = 30
