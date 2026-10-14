@@ -3,6 +3,8 @@
 
 # hashlib：计算文件内容的 SHA-256 哈希
 import hashlib
+# logging：Python 标准库的日志模块
+import logging
 # PurePath：只做路径字符串处理、不访问磁盘的路径类，用来取文件名和扩展名
 from pathlib import PurePath
 # Annotated：给类型附加额外信息（这里用来给查询参数加校验规则）
@@ -26,6 +28,11 @@ from app.models import Document, UsageAction, UsageLog
 from app.schemas import DocumentOut
 # 文件存取
 from app.storage import delete_file, save_file
+# 后台解析任务
+from app.tasks import process_document
+
+# 日志对象。__name__ 是当前模块名 "app.routers.documents"，日志里能看出是哪个模块打的
+logger = logging.getLogger(__name__)
 
 # 所有路径以 /documents 开头，Swagger 里归到 "documents" 组
 router = APIRouter(prefix="/documents", tags=["documents"])
@@ -148,8 +155,16 @@ def upload_document(file: UploadFile, response: Response, user: CurrentUser, db:
         # 不带参数的 raise：把原来的异常继续往外抛，FastAPI 会返回 500
         raise
 
-    # ---------- 第 5 步（阶段 3）：投递后台解析任务 ----------
+    # ---------- 第 5 步：投递后台解析任务 ----------
     # 必须放在 commit 之后：否则 worker 可能在事务提交前就去查这个文档，查不到
+    try:
+        # .delay(...)：只是往 Redis 里放一条消息，几毫秒就返回，不等解析完成
+        process_document.delay(doc.id)
+    except Exception:
+        # 投递失败（比如 Redis 挂了）：文档和文件都已经保存成功，不应该因此让整个上传失败。
+        # 文档会停在 pending，之后运行 scripts/requeue_pending.py 会把它重新投递
+        # logger.exception：记录错误，并自动附上完整的报错堆栈
+        logger.exception("failed to enqueue document %s; it stays pending", doc.id)
     return doc
 
 

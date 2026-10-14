@@ -33,6 +33,11 @@ def save_file(user_id: int, extension: str, content: bytes) -> str:
     return relative_path
 
 
+# 读取文件的全部内容（后台任务解析文档时用）。文件不存在时抛出 FileNotFoundError
+def read_file(relative_path: str) -> bytes:
+    return _full_path(relative_path).read_bytes()
+
+
 # 删除文件。文件不存在时什么也不做（不报错）
 def delete_file(relative_path: str) -> None:
     # missing_ok=True：文件不存在时不抛异常。

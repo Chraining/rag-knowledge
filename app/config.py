@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     # 单个文件的大小上限：10MB。10 * 1024 * 1024 = 10485760 字节
     max_upload_bytes: int = 10 * 1024 * 1024
 
+    # ---------- 后台任务（Celery） ----------
+    # 消息队列（broker）的地址：上传接口把"请处理文档 X"的消息放进 Redis，worker 从这里取
+    # 格式：redis://主机:端口/库编号。Redis 默认有 16 个库（0-15），这里用 0 号
+    celery_broker_url: str = "redis://localhost:6379/0"
+
 
 # 在模块加载时创建一个全局唯一的配置对象
 # 其他文件用 `from app.config import settings` 拿到它，不用每次都重新读 .env

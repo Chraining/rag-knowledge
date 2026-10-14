@@ -1,0 +1,181 @@
+# 文档处理的核心逻辑：读文件 → 提取文本 → 切分 → 写入 chunks → 更新状态。
+# 这里的函数都接收一个数据库会话（db）作为参数，不关心自己是被谁调用的：
+#   - 后台任务（tasks.py）调用它们时，传入连接开发数据库的会话
+#   - 测试调用它们时，传入连接测试数据库的会话
+# 向量化（embedding）放在阶段 4，和向量列一起加。
+#
+# 状态机（只允许这几种变化）：
+#   pending ──> processing ──> ready
+#                   │
+#                   └────────> failed ──(重新投递)──> processing
+#
+# 幂等：同一个文档的任务可能被执行多次（重复投递、worker 崩溃后重新投递、失败重试），
+# 下面的设计保证无论执行几次，最终结果都和执行一次一样：
+#   1. 已经是 ready 的文档直接跳过
+#   2. 写 chunks 时先锁住文档这一行（SELECT ... FOR UPDATE），两个任务同时写时只能一个一个来
+#   3. 写入前先删掉这个文档的旧 chunks，所以不会出现重复的段落
+#   4. (document_id, chunk_index) 有唯一约束，作为数据库层面的最后一道保险
+
+# hashlib：重新计算文件哈希，检查文件有没有损坏
+import hashlib
+# io：把 bytes 包装成"像文件一样可以读取的对象"，pypdf 需要这种对象
+import io
+# datetime、UTC：记录处理完成的时间（带时区）
+from datetime import UTC, datetime
+# PurePath：从路径字符串里取扩展名
+from pathlib import PurePath
+
+# PdfReader：读取 PDF；PyPdfError：pypdf 所有错误的基类（文件损坏等）
+from pypdf import PdfReader
+from pypdf.errors import PyPdfError
+# delete：构造 DELETE 语句；select：构造 SELECT 语句；update：构造 UPDATE 语句
+from sqlalchemy import delete, select, update
+# Session：数据库会话的类型
+from sqlalchemy.orm import Session
+
+# 模型
+from app.models import Chunk, Document, DocumentStatus
+# 读取磁盘上的文件
+from app.storage import read_file
+
+# 每段最多多少个字符
+CHUNK_SIZE = 500
+# 相邻两段重叠多少个字符。
+# 为什么要重叠：如果一句话正好被切在两段的边界上，两段各拿到半句，检索时哪段都匹配不好；
+# 重叠一部分，边界附近的内容会同时出现在两段里
+CHUNK_OVERLAP = 50
+
+
+# "永久性错误"：文件内容本身有问题（损坏的 PDF、扫描件提取不出文字等）。
+# 这类错误重试多少次结果都一样，所以不重试，直接标记为 failed。
+# 和它相对的是"临时性错误"（数据库短暂断开、磁盘忙等），那种值得重试，见 tasks.py
+class PermanentError(Exception):
+    pass  # 不需要额外内容，只是用类名来区分错误类型
+
+
+# 从文件内容里提取纯文本
+def extract_text(content: bytes, extension: str) -> str:
+    # .md 和 .txt：上传时已经检查过是 UTF-8，直接解码
+    if extension != ".pdf":
+        text = content.decode("utf-8")
+    else:
+        try:
+            # 把 bytes 包装成文件对象，交给 pypdf 解析
+            reader = PdfReader(io.BytesIO(content))
+            # 有密码的 PDF 读不出内容
+            if reader.is_encrypted:
+                raise PermanentError("PDF is encrypted")
+            # 逐页提取文字，页与页之间用空行隔开。
+            # extract_text() 在某些页上可能返回 None，用 "or ''" 换成空字符串
+            text = "\n\n".join(page.extract_text() or "" for page in reader.pages)
+        except PyPdfError as e:
+            # 文件头是 %PDF-，但内容损坏，pypdf 解析失败。from e：保留原始错误，方便排查
+            raise PermanentError(f"Cannot parse PDF: {e}") from e
+    # PostgreSQL 的 text 类型不能存空字符（\x00），而 PDF 提取出的文字里偶尔会有，必须去掉
+    return text.replace("\x00", "")
+
+
+# 把长文本切成多段，相邻两段有重叠
+# 例如 size=5, overlap=2，文本 "abcdefghij" 切成 "abcde"、"defgh"、"ghij"
+def split_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    # 每次窗口往后移动的距离
+    step = size - overlap
+    # 存放切出来的段落
+    chunks: list[str] = []
+    # range(0, 总长度, 步长)：start 依次是 0, step, 2*step, ...
+    for start in range(0, len(text), step):
+        # 取出 [start, start+size) 这一段，去掉首尾的空白
+        piece = text[start : start + size].strip()
+        # 只有空白的段落没有意义，跳过
+        if piece:
+            chunks.append(piece)
+        # 这一段已经到了文本末尾，后面不用再切了（否则最后会多出一段完全被包含的小尾巴）
+        if start + size >= len(text):
+            break
+    return chunks
+
+
+# 第一步（事务 1）：把文档状态改成 processing。返回文档对象；返回 None 表示"不需要处理"
+def start_processing(db: Session, document_id: int) -> Document | None:
+    # SELECT ... FOR UPDATE：查询的同时锁住这一行，直到 commit 才释放。
+    # 另一个任务如果也想锁这一行，必须等这里提交，所以两个任务不会同时修改状态
+    doc = db.scalar(select(Document).where(Document.id == document_id).with_for_update())
+    # 文档不存在（任务排队期间用户把它删了），或者已经处理完了（重复投递）：什么都不做
+    if doc is None or doc.status == DocumentStatus.READY:
+        # 结束事务，释放锁
+        db.rollback()
+        return None
+    # pending 或 failed（重试）或 processing（worker 崩溃后重新投递）都可以进入 processing
+    doc.status = DocumentStatus.PROCESSING
+    # 清掉上一次失败留下的错误信息
+    doc.error_message = None
+    # 立刻提交，让用户查询时能看到"处理中"
+    db.commit()
+    return doc
+
+
+# 第二步（不碰数据库）：读文件、校验、提取文字、切分。这是最耗时的部分，所以放在事务外面，
+# 避免长时间锁住数据库的行。阶段 4 的 embedding（调外部 API，可能要几十秒）也会放在这一步
+def read_and_split(doc: Document) -> list[str]:
+    try:
+        content = read_file(doc.storage_path)
+    except FileNotFoundError as e:
+        # 记录还在但文件没了，重试也找不到
+        raise PermanentError("File is missing from storage") from e
+    # 这里用上 content_hash：重新计算哈希，和上传时记下的比较。
+    # 不一样说明文件在磁盘上被改动或损坏了，不能把错误的内容存进知识库
+    if hashlib.sha256(content).hexdigest() != doc.content_hash:
+        raise PermanentError("File content does not match its hash")
+    # 取扩展名（例如 ".pdf"），决定用哪种方式提取文字。存储路径里的扩展名是上传时校验过的
+    extension = PurePath(doc.storage_path).suffix
+    chunks = split_text(extract_text(content, extension))
+    # 一段文字都没有：通常是扫描版 PDF（每页都是图片），需要 OCR 才能识别，目前不支持
+    if not chunks:
+        raise PermanentError("No text could be extracted (scanned PDF?)")
+    return chunks
+
+
+# 第三步（事务 2）：写入 chunks，状态改成 ready。返回 True 表示这次写入了，False 表示跳过了
+def save_chunks(db: Session, document_id: int, chunks: list[str]) -> bool:
+    # 再次锁住文档这一行。第一步的锁在 commit 时已经释放了，这里必须重新锁：
+    # 如果两个任务同时走到这里，第二个会等第一个提交，然后看到状态已经是 ready，直接跳过
+    doc = db.scalar(select(Document).where(Document.id == document_id).with_for_update())
+    # 处理期间文档被删了，或者另一个任务已经先完成了：什么都不写
+    if doc is None or doc.status == DocumentStatus.READY:
+        db.rollback()
+        return False
+    # 删掉这个文档的旧 chunks（如果有的话），保证不会重复
+    db.execute(delete(Chunk).where(Chunk.document_id == document_id))
+    # 批量添加新的 chunks。enumerate 同时给出序号 i（从 0 开始）和内容 text
+    db.add_all(Chunk(document_id=document_id, chunk_index=i, content=text) for i, text in enumerate(chunks))
+    # 更新文档的状态和统计信息
+    doc.status = DocumentStatus.READY
+    doc.chunk_count = len(chunks)
+    doc.processed_at = datetime.now(UTC)
+    # 写 chunks 和改状态在同一个事务里：要么都成功，要么都不生效。
+    # 不会出现"状态是 ready，但 chunks 只写了一半"的情况
+    db.commit()
+    return True
+
+
+# 把文档标记为失败，并记下原因
+def mark_failed(db: Session, document_id: int, message: str) -> None:
+    # 用一条 UPDATE 语句直接改，不用先查出来。
+    # 条件 status != 'ready'：如果另一个重复的任务已经处理成功了，不能把成功的结果改成失败
+    db.execute(
+        update(Document)
+        .where(Document.id == document_id, Document.status != DocumentStatus.READY)
+        # 错误信息截断到 1000 个字符，避免把超长的报错堆栈全部存进数据库
+        .values(status=DocumentStatus.FAILED, error_message=message[:1000])
+    )
+    db.commit()
+
+
+# 处理一个文档的完整流程。后台任务调用的就是这个函数
+def process_document(db: Session, document_id: int) -> None:
+    doc = start_processing(db, document_id)
+    # 不需要处理，直接结束
+    if doc is None:
+        return
+    chunks = read_and_split(doc)
+    save_chunks(db, document_id, chunks)

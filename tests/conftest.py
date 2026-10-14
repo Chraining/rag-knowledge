@@ -106,6 +106,26 @@ def make_user(db):
     return _make
 
 
+# autouse=True：每个测试都会自动使用这个 fixture，不用写在参数里。
+# 作用：把上传接口里的"投递后台任务"换成"记到一个列表里"。
+#   1. 测试不需要真的启动 Redis
+#   2. 测试可以检查"有没有投递、投递的是哪个文档"
+# 测试里写参数 enqueued 就能拿到这个列表
+@pytest.fixture(autouse=True)
+def enqueued(monkeypatch):
+    # 记录被投递的文档 id
+    calls: list[int] = []
+
+    # 一个假的任务对象，只有 delay 方法。
+    # staticmethod：这个方法不需要 self 参数
+    class FakeTask:
+        delay = staticmethod(calls.append)
+
+    # 替换 documents 路由模块里的 process_document（它在 import 时就绑定到了模块的变量上）
+    monkeypatch.setattr("app.routers.documents.process_document", FakeTask)
+    return calls
+
+
 # 测试客户端：用它给应用发请求，就像真实的前端一样
 # monkeypatch：pytest 自带的 fixture，用来临时修改属性，测试结束后自动恢复
 # tmp_path：pytest 自带的 fixture，每个测试一个全新的临时目录，测试结束后自动清理
