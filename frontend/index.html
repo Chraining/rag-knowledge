@@ -1,0 +1,350 @@
+<!doctype html>
+<!-- 简易前端：一个文件包含 HTML（页面结构）、CSS（样式）、JavaScript（交互逻辑）。 -->
+<!-- 前后端怎么交互：用户点按钮 → JavaScript 用 fetch() 发 HTTP 请求给后端接口 → 后端返回 JSON → JavaScript 把数据显示到页面上。 -->
+<!-- 这和你在 Swagger 里点 Execute 是同一回事，只是换成了代码来发请求。 -->
+<html lang="zh-CN">
+<head>
+  <!-- 文字编码用 UTF-8，中文才不会乱码 -->
+  <meta charset="utf-8">
+  <!-- 让页面在手机上也按屏幕宽度显示 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- 浏览器标签页上的标题 -->
+  <title>RAG 知识库</title>
+  <style>
+    /* 全局：字体、背景色、去掉默认外边距 */
+    body { font-family: system-ui, sans-serif; margin: 0; background: #f5f5f5; color: #222; }
+    /* 隐藏元素用的类：加上它就不显示 */
+    .hidden { display: none !important; }
+    /* 登录框：居中的白色卡片 */
+    #login-box { max-width: 320px; margin: 80px auto; background: #fff; padding: 24px; border-radius: 8px; }
+    /* 输入框和按钮的通用样式 */
+    input, button { font: inherit; padding: 6px 10px; margin: 4px 0; }
+    /* 登录框里的输入框占满一行 */
+    #login-box input { width: 100%; box-sizing: border-box; }
+    /* 主界面：左边栏 + 右边聊天区，左右排列 */
+    #main { display: flex; height: 100vh; }
+    /* 左边栏：固定宽度，内容多了可以滚动 */
+    #sidebar { width: 300px; background: #fff; padding: 12px; overflow-y: auto; border-right: 1px solid #ddd; }
+    /* 文件选择框最宽不超过左边栏，否则会撑出横向滚动条。border-box：宽度把内边距也算进去 */
+    #file { max-width: 100%; box-sizing: border-box; }
+    /* 右边聊天区：占满剩下的宽度，从上到下排列 */
+    #chat { flex: 1; display: flex; flex-direction: column; }
+    /* 消息列表：占满剩下的高度，可以滚动 */
+    #messages { flex: 1; overflow-y: auto; padding: 16px; }
+    /* 一条消息：圆角气泡，保留换行 */
+    .msg { max-width: 75%; margin: 8px 0; padding: 8px 12px; border-radius: 8px; white-space: pre-wrap; }
+    /* 用户的消息：蓝色，靠右 */
+    .msg.user { background: #d6e8ff; margin-left: auto; }
+    /* AI 的回答：白色，靠左 */
+    .msg.assistant { background: #fff; }
+    /* 引用来源：小号灰色字 */
+    .sources { font-size: 12px; color: #666; margin-top: 6px; }
+    /* 底部输入区：输入框和发送按钮左右排列 */
+    #ask-form { display: flex; gap: 8px; padding: 12px; background: #fff; border-top: 1px solid #ddd; }
+    /* 提问输入框占满剩下的宽度 */
+    #question { flex: 1; }
+    /* 列表：去掉圆点和缩进 */
+    ul { list-style: none; padding: 0; }
+    /* 列表的每一项 */
+    li { padding: 4px 0; font-size: 14px; }
+    /* 可点击的会话：鼠标变成手形 */
+    li.clickable { cursor: pointer; }
+    /* 当前打开的会话加粗 */
+    li.active { font-weight: bold; }
+    /* 错误提示：红色 */
+    .error { color: #c00; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <!-- ==================== 登录 / 注册 ==================== -->
+  <div id="login-box">
+    <h2>RAG 知识库</h2>
+    <!-- 用户名输入框 -->
+    <input id="username" placeholder="用户名">
+    <!-- 邮箱输入框，只有注册时需要 -->
+    <input id="email" placeholder="邮箱（注册时填写）">
+    <!-- 密码输入框，type="password" 会把输入显示成圆点 -->
+    <input id="password" type="password" placeholder="密码（至少 8 位）">
+    <!-- 两个按钮，点击时分别调用下面 JavaScript 里的 login() 和 register() -->
+    <button onclick="login()">登录</button>
+    <button onclick="register()">注册</button>
+    <!-- 显示错误信息的地方 -->
+    <p id="login-error" class="error"></p>
+  </div>
+
+  <!-- ==================== 主界面（登录后才显示） ==================== -->
+  <div id="main" class="hidden">
+    <!-- 左边栏：文档和会话 -->
+    <div id="sidebar">
+      <!-- 显示当前用户名和退出按钮 -->
+      <p>当前用户：<b id="me"></b> <button onclick="logout()">退出</button></p>
+
+      <h3>我的文档</h3>
+      <!-- 选择文件的控件，只允许选 .md .txt .pdf -->
+      <input id="file" type="file" accept=".md,.txt,.pdf">
+      <!-- 点击后调用 upload() -->
+      <button onclick="upload()">上传</button>
+      <!-- 上传出错时显示在这里 -->
+      <p id="upload-error" class="error"></p>
+      <!-- 文档列表，由 JavaScript 填充 -->
+      <ul id="doc-list"></ul>
+
+      <h3>会话</h3>
+      <!-- 点击后开始一个新会话 -->
+      <button onclick="newConversation()">+ 新会话</button>
+      <!-- 会话列表，由 JavaScript 填充 -->
+      <ul id="conv-list"></ul>
+    </div>
+
+    <!-- 右边：聊天区 -->
+    <div id="chat">
+      <!-- 消息列表，由 JavaScript 填充 -->
+      <div id="messages"></div>
+      <!-- 提问表单。onsubmit：按回车或点发送按钮时调用 ask() -->
+      <form id="ask-form" onsubmit="ask(event)">
+        <input id="question" placeholder="问一个关于你文档的问题…" autocomplete="off">
+        <button id="ask-button">发送</button>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    // ==================== 状态（页面上需要记住的数据） ====================
+
+    // 登录后拿到的 token。存在 localStorage 里，刷新页面后还在，不用重新登录
+    let token = localStorage.getItem("token");
+    // 当前打开的会话 id。null 表示"新会话"：下一次提问时后端会新建一个
+    let conversationId = null;
+    // 文档 id → 文件名，用来在历史消息里显示来源的文件名
+    let filenames = {};
+
+    // 简写：按 id 找到页面上的元素
+    const $ = (id) => document.getElementById(id);
+
+    // ==================== 和后端通信的核心函数 ====================
+
+    // 所有接口调用都走这个函数。path 是接口路径，例如 "/documents"；options 是请求方法、请求体等
+    async function api(path, options = {}) {
+      // 请求头。只要有 token，就带上 "Authorization: Bearer xxx"，后端靠它知道"你是谁"
+      const headers = token ? { Authorization: "Bearer " + token } : {};
+      // 如果请求体是普通对象，就转成 JSON 字符串，并告诉后端"我发的是 JSON"
+      if (options.json) {
+        headers["Content-Type"] = "application/json";
+        options.body = JSON.stringify(options.json);
+      }
+      // fetch：浏览器自带的发 HTTP 请求的函数。await：等后端返回结果
+      const response = await fetch(path, { ...options, headers });
+      // 401：token 过期或无效，退回登录页
+      if (response.status === 401 && token) {
+        logout();
+        throw new Error("登录已过期，请重新登录");
+      }
+      // 204 No Content：成功但没有返回内容（例如删除）
+      if (response.status === 204) return null;
+      // 把返回的 JSON 文本解析成 JavaScript 对象
+      const data = await response.json();
+      // 状态码不是 2xx，说明出错了。后端的错误信息放在 detail 字段里
+      if (!response.ok) {
+        // 422 校验错误时 detail 是一个列表，把每条的 msg 拼起来；其他错误 detail 是字符串
+        const detail = Array.isArray(data.detail) ? data.detail.map((d) => d.msg).join("；") : data.detail;
+        throw new Error(detail || "请求失败：" + response.status);
+      }
+      return data;
+    }
+
+    // ==================== 登录 / 注册 / 退出 ====================
+
+    // 登录：POST /auth/login。注意这个接口按 OAuth2 标准要求用"表单格式"，而不是 JSON
+    async function login() {
+      try {
+        // FormData 就是表单数据，等同于网页表单提交
+        const form = new FormData();
+        form.append("username", $("username").value);
+        form.append("password", $("password").value);
+        const data = await api("/auth/login", { method: "POST", body: form });
+        // 保存 token，之后每个请求都会带上它
+        token = data.access_token;
+        localStorage.setItem("token", token);
+        // 进入主界面
+        await showMain();
+      } catch (e) {
+        // 出错就把错误信息显示在登录框里
+        $("login-error").textContent = e.message;
+      }
+    }
+
+    // 注册：POST /auth/register（JSON 格式），成功后自动登录
+    async function register() {
+      try {
+        await api("/auth/register", {
+          method: "POST",
+          json: { username: $("username").value, email: $("email").value, password: $("password").value },
+        });
+        await login();
+      } catch (e) {
+        $("login-error").textContent = e.message;
+      }
+    }
+
+    // 退出：扔掉 token，回到登录页。token 是"无状态"的，后端不需要做任何事
+    function logout() {
+      token = null;
+      localStorage.removeItem("token");
+      $("main").classList.add("hidden");
+      $("login-box").classList.remove("hidden");
+    }
+
+    // 进入主界面：显示用户名，加载文档和会话列表
+    async function showMain() {
+      // GET /auth/me：用 token 换回当前用户的信息
+      const me = await api("/auth/me");
+      $("me").textContent = me.username;
+      $("login-box").classList.add("hidden");
+      $("main").classList.remove("hidden");
+      // 同时加载文档和会话，两个请求并行发出
+      await Promise.all([loadDocuments(), loadConversations()]);
+    }
+
+    // ==================== 文档 ====================
+
+    // 上传：POST /documents，用表单格式发送文件
+    async function upload() {
+      // 取出用户选择的文件
+      const file = $("file").files[0];
+      if (!file) return;
+      $("upload-error").textContent = "";
+      try {
+        const form = new FormData();
+        // 字段名 "file" 要和后端接口参数名一致
+        form.append("file", file);
+        await api("/documents", { method: "POST", body: form });
+        // 清空文件选择框，刷新列表
+        $("file").value = "";
+        await loadDocuments();
+      } catch (e) {
+        $("upload-error").textContent = e.message;
+      }
+    }
+
+    // 加载文档列表：GET /documents
+    async function loadDocuments() {
+      const docs = await api("/documents?limit=100");
+      // 先清空列表，再一项一项加进去
+      const list = $("doc-list");
+      list.innerHTML = "";
+      for (const doc of docs) {
+        // 记住文件名，显示历史消息的来源时要用
+        filenames[doc.id] = doc.filename;
+        // 创建一个列表项。用 textContent 而不是 innerHTML：
+        // 文件名是用户提供的，如果当成 HTML 插入，恶意文件名就能在页面里执行脚本（XSS 攻击）
+        const li = document.createElement("li");
+        li.textContent = `${doc.filename} [${doc.status}] `;
+        // 删除按钮：DELETE /documents/{id}
+        const del = document.createElement("button");
+        del.textContent = "删除";
+        del.onclick = async () => {
+          await api(`/documents/${doc.id}`, { method: "DELETE" });
+          await loadDocuments();
+        };
+        li.appendChild(del);
+        list.appendChild(li);
+      }
+      // 如果还有文档在后台处理中（pending 或 processing），2 秒后再查一次，直到全部处理完。
+      // 这叫"轮询"：后端处理是异步的，前端只能隔一会儿去问一下"好了没"
+      if (docs.some((d) => d.status === "pending" || d.status === "processing")) {
+        setTimeout(loadDocuments, 2000);
+      }
+    }
+
+    // ==================== 会话 ====================
+
+    // 加载会话列表：GET /conversations
+    async function loadConversations() {
+      const conversations = await api("/conversations");
+      const list = $("conv-list");
+      list.innerHTML = "";
+      for (const c of conversations) {
+        const li = document.createElement("li");
+        li.textContent = c.title;
+        li.className = "clickable" + (c.id === conversationId ? " active" : "");
+        // 点击会话：打开它
+        li.onclick = () => openConversation(c.id);
+        list.appendChild(li);
+      }
+    }
+
+    // 打开一个旧会话：GET /conversations/{id}/messages，把历史消息显示出来
+    async function openConversation(id) {
+      conversationId = id;
+      const messages = await api(`/conversations/${id}/messages`);
+      $("messages").innerHTML = "";
+      for (const m of messages) {
+        // 历史消息里的来源只有 document_id，用 filenames 换成文件名（文档被删了就显示编号）
+        const sources = (m.sources || []).map((s) => filenames[s.document_id] || `文档 #${s.document_id}`);
+        addMessage(m.role, m.content, sources);
+      }
+      // 刷新列表，让当前会话加粗
+      await loadConversations();
+    }
+
+    // 新会话：只是把 conversationId 清空，下次提问时后端会新建
+    function newConversation() {
+      conversationId = null;
+      $("messages").innerHTML = "";
+      loadConversations();
+    }
+
+    // ==================== 提问 ====================
+
+    // 提问：POST /chat
+    async function ask(event) {
+      // 阻止表单的默认行为（默认会刷新整个页面）
+      event.preventDefault();
+      const question = $("question").value.trim();
+      if (!question) return;
+      // 先把问题显示出来，清空输入框，禁用发送按钮（防止等待时重复点击）
+      addMessage("user", question, []);
+      $("question").value = "";
+      $("ask-button").disabled = true;
+      try {
+        // conversationId 为 null 时，JSON 里就是 "conversation_id": null，后端会新建会话
+        const data = await api("/chat", { method: "POST", json: { question, conversation_id: conversationId } });
+        // 记住会话 id，下一次提问就是追问
+        conversationId = data.conversation_id;
+        // 显示回答和来源（文件名 + 相似度）
+        addMessage("assistant", data.answer, data.sources.map((s) => `${s.filename}（${s.score}）`));
+        // 刷新会话列表（新会话会出现在最上面）
+        await loadConversations();
+      } catch (e) {
+        // 出错（429 配额用完、503 AI 服务不可用等）也显示在聊天区
+        addMessage("assistant", "⚠️ " + e.message, []);
+      } finally {
+        // 不管成功失败，都恢复发送按钮
+        $("ask-button").disabled = false;
+      }
+    }
+
+    // 在聊天区加一条消息。role 是 "user" 或 "assistant"；sources 是来源文字的列表
+    function addMessage(role, text, sources) {
+      const div = document.createElement("div");
+      div.className = "msg " + role;
+      // 同样用 textContent，防止回答内容被当成 HTML 执行
+      div.textContent = text;
+      if (sources.length) {
+        const s = document.createElement("div");
+        s.className = "sources";
+        s.textContent = "来源：" + sources.join("，");
+        div.appendChild(s);
+      }
+      $("messages").appendChild(div);
+      // 滚动到最底部，让最新消息可见
+      $("messages").scrollTop = $("messages").scrollHeight;
+    }
+
+    // ==================== 页面打开时 ====================
+
+    // 如果之前登录过（localStorage 里有 token），直接进入主界面；token 过期的话 api() 会退回登录页
+    if (token) showMain().catch(() => logout());
+  </script>
+</body>
+</html>
