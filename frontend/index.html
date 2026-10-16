@@ -141,13 +141,15 @@
       }
       // 204 No Content：成功但没有返回内容（例如删除）
       if (response.status === 204) return null;
-      // 把返回的 JSON 文本解析成 JavaScript 对象
-      const data = await response.json();
+      // 把返回的 JSON 文本解析成 JavaScript 对象。
+      // 有些错误不是应用返回的，而是 nginx 返回的 HTML 页面（例如文件太大时的 413），解析会失败，
+      // 这时当作空对象，下面就会根据状态码显示提示（例如 413 显示"文件太大"）
+      const data = await response.json().catch(() => ({}));
       // 状态码不是 2xx，说明出错了。后端的错误信息放在 detail 字段里
       if (!response.ok) {
         // 422 校验错误时 detail 是一个列表，把每条的 msg 拼起来；其他错误 detail 是字符串
         const detail = Array.isArray(data.detail) ? data.detail.map((d) => d.msg).join("；") : data.detail;
-        throw new Error(detail || "请求失败：" + response.status);
+        throw new Error(detail || (response.status === 413 ? "文件太大（最大 10MB）" : "请求失败：" + response.status));
       }
       return data;
     }

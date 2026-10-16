@@ -1,4 +1,4 @@
-# 整个系统的四个服务：应用（API）、worker（后台任务）、PostgreSQL（带 pgvector 扩展）、Redis。
+# 整个系统的五个服务：nginx（入口）、应用（API）、worker（后台任务）、PostgreSQL（带 pgvector 扩展）、Redis。
 # 全部启动：docker compose up -d --build     （--build：代码改过就重新构建镜像）
 # 看日志：  docker compose logs -f app worker
 # 停止：    docker compose stop
@@ -13,8 +13,10 @@ x-app-common: &app-common
   env_file: .env
   # 这几项覆盖 .env 里的值：在容器里，127.0.0.1 指的是容器自己，
   # 要用服务名（postgres、redis）访问其他容器，用容器内部的端口（5432，不是本机映射出来的 5433）
+  # ${POSTGRES_PASSWORD:-rag}：Docker Compose 会从 .env 里读取 POSTGRES_PASSWORD 填进来，没设置就用 rag。
+  # 服务器上一定要在 .env 里设置一个强密码（只用字母、数字、- 和 _，否则放进地址里会出错）
   environment:
-    DATABASE_URL: postgresql+psycopg://rag:rag@postgres:5432/rag
+    DATABASE_URL: postgresql+psycopg://rag:${POSTGRES_PASSWORD:-rag}@postgres:5432/rag
     CELERY_BROKER_URL: redis://redis:6379/0
     REDIS_URL: redis://redis:6379/1
   volumes:
@@ -50,12 +52,30 @@ services:
     # 用 Celery 默认的多进程模式；--concurrency=2：同时处理 2 个文档
     command: celery -A app.celery_app worker --loglevel=info --concurrency=2
 
+  nginx:
+    # 反向代理：所有外部请求先到 nginx，再转发给应用（配置和原因见 docker/nginx.conf）
+    image: nginx:1.27-alpine
+    ports:
+      # 本机默认只绑定 127.0.0.1（访问 http://127.0.0.1）。
+      # 服务器上在 .env 里设置 NGINX_BIND=0.0.0.0，才对外开放，别人才能访问
+      - "${NGINX_BIND:-127.0.0.1}:80:80"
+    volumes:
+      # 用我们的配置替换 nginx 默认的站点配置。:ro 只读，容器不能修改它
+      - ./docker/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      # 应用健康了再启动 nginx，否则刚启动时的请求会得到 502
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+
   postgres:
     # 官方 PostgreSQL 18 镜像 + 预装好的 pgvector 扩展
     image: pgvector/pgvector:pg18
     environment:
       POSTGRES_USER: rag  # 用户名
-      POSTGRES_PASSWORD: rag  # 密码（只用于本机开发，部署到服务器前要换成强密码）
+      # 密码：从 .env 的 POSTGRES_PASSWORD 读取，本机开发没设置时用 rag。
+      # 注意：只在数据库第一次初始化（数据卷还是空的）时生效，之后再改这里，已有数据库的密码不会跟着变
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rag}
       POSTGRES_DB: rag  # 自动创建的开发库
     ports:
       # 只绑定 127.0.0.1：只有本机能连，局域网里的其他机器连不上。
