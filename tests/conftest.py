@@ -20,6 +20,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 # Session：数据库会话
 from sqlalchemy.orm import Session
+# Vector：向量类型，假的 embedding 和真实的一样返回它
+from pgvector import Vector
 
 # 读取配置（拿测试数据库地址）
 from app.config import settings
@@ -155,11 +157,12 @@ class FakeLLM:
         self.fail = False  # 设成 True 后，所有调用都抛 LLMUnavailable，模拟服务挂了
         self.answer = "fake answer"  # chat 返回的固定回答
 
-    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+    # 和真实的 llm.embed_texts 一样返回 Vector
+    def embed_texts(self, texts: list[str]) -> list[Vector]:
         if self.fail:
             raise llm.LLMUnavailable("fake outage")
         self.embedded.extend(texts)
-        return [fake_embedding(t) for t in texts]
+        return [Vector(fake_embedding(t)) for t in texts]
 
     def chat(self, messages: list[dict]) -> tuple[str, int]:
         if self.fail:

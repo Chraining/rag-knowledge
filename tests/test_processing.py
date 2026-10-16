@@ -371,3 +371,16 @@ def test_embedding_outage_is_retried_then_fails(task_db, make_document, fake_llm
     assert doc.status == DocumentStatus.FAILED
     assert "Failed after 3 retries" in doc.error_message
     assert "LLMUnavailable" in doc.error_message
+
+
+# 测试：段落分批写入数据库时，所有段落都写进去了，序号连续、顺序正确
+def test_chunks_are_saved_in_batches(db, make_document, monkeypatch):
+    # 每批 2 段，5 段的文档要分 3 批（2 + 2 + 1）
+    monkeypatch.setattr(processing, "SAVE_BATCH_SIZE", 2)
+    monkeypatch.setattr(processing, "CHUNK_SIZE", 10)
+    text = "".join(f"段落{i}内容很长啊" for i in range(5))
+    doc = make_document(text.encode())
+    # split_text 的默认参数在定义函数时就确定了，改 CHUNK_SIZE 影响不到它，所以这里直接替换切分结果
+    monkeypatch.setattr(processing, "split_text", lambda t: [f"chunk {i}" for i in range(5)])
+    processing.process_document(db, doc.id)
+    assert chunk_contents(db, doc.id) == [f"chunk {i}" for i in range(5)]

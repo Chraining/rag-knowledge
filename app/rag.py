@@ -51,7 +51,8 @@ def embed_query(question: str) -> list[float]:
         cached = None
     if cached is not None:
         return json.loads(cached)
-    vector = llm.embed_texts([question])[0]
+    # to_list()：Vector 转回普通的 float 列表，才能用 json 存进 Redis
+    vector = llm.embed_texts([question])[0].to_list()
     try:
         # ex：过期时间（秒）
         redis_client.client.set(key, json.dumps(vector), ex=EMBEDDING_CACHE_SECONDS)

@@ -19,11 +19,15 @@
 import hashlib
 # datetime、UTC：记录处理完成的时间（带时区）
 from datetime import UTC, datetime
+# batched：把一个序列按固定大小分组，例如 batched([1,2,3,4,5], 2) → (1,2) (3,4) (5,)
+from itertools import batched
 # PurePath：从路径字符串里取扩展名
 from pathlib import PurePath
 
-# delete：构造 DELETE 语句；select：构造 SELECT 语句；update：构造 UPDATE 语句
-from sqlalchemy import delete, select, update
+# Vector：向量类型（见 llm.embed_texts）
+from pgvector import Vector
+# delete、insert、select、update：构造对应的 SQL 语句
+from sqlalchemy import delete, insert, select, update
 # Session：数据库会话的类型
 from sqlalchemy.orm import Session
 
@@ -38,6 +42,8 @@ from app.storage import read_file
 
 # 每段最多多少个字符
 CHUNK_SIZE = 500
+# 写数据库时每批插入多少段。见 save_chunks
+SAVE_BATCH_SIZE = 200
 # 相邻两段重叠多少个字符。
 # 为什么要重叠：如果一句话正好被切在两段的边界上，两段各拿到半句，检索时哪段都匹配不好；
 # 重叠一部分，边界附近的内容会同时出现在两段里
@@ -135,7 +141,7 @@ def read_and_split(doc: Document) -> list[str]:
 
 
 # 第三步（事务 2）：写入 chunks 和它们的向量，状态改成 ready。返回 True 表示这次写入了，False 表示跳过了
-def save_chunks(db: Session, document_id: int, chunks: list[str], vectors: list[list[float]]) -> bool:
+def save_chunks(db: Session, document_id: int, chunks: list[str], vectors: list[Vector]) -> bool:
     # 再次锁住文档这一行。第一步的锁在 commit 时已经释放了，这里必须重新锁：
     # 如果两个任务同时走到这里，第二个会等第一个提交，然后看到状态已经是 ready，直接跳过
     doc = db.scalar(select(Document).where(Document.id == document_id).with_for_update())
@@ -145,11 +151,18 @@ def save_chunks(db: Session, document_id: int, chunks: list[str], vectors: list[
         return False
     # 删掉这个文档的旧 chunks（如果有的话），保证不会重复
     db.execute(delete(Chunk).where(Chunk.document_id == document_id))
-    # 批量添加新的 chunks。zip 把每段文字和它的向量配成一对；enumerate 再给每一对加上序号 i（从 0 开始）
-    db.add_all(
-        Chunk(document_id=document_id, chunk_index=i, content=text, embedding=vector)
+    # 每段文字和它的向量配成一行。zip 把两者配对；enumerate 再加上序号 i（从 0 开始）。
+    # 这里用的是生成器（圆括号），不会一次性把所有行都造出来
+    rows = (
+        {"document_id": document_id, "chunk_index": i, "content": text, "embedding": vector}
         for i, (text, vector) in enumerate(zip(chunks, vectors, strict=True))
     )
+    # 每次插入 200 行，而不是一次插入全部。
+    # 原因：写入时每个向量都要先转成约 19KB 的文本，一本长小说有上万段，一次性全部转换要几百 MB 内存，
+    # 实测 500 万字的文档会让 worker 超过 400MB 的内存上限被系统杀掉。分批之后内存峰值和文档长度基本无关。
+    # 所有批次仍然在同一个事务里，最后一起 commit，"要么全写进去，要么都不生效"的保证不变
+    for batch in batched(rows, SAVE_BATCH_SIZE):
+        db.execute(insert(Chunk), list(batch))
     # 更新文档的状态和统计信息
     doc.status = DocumentStatus.READY
     doc.chunk_count = len(chunks)

@@ -11,6 +11,8 @@
 
 # OpenAI：客户端类；OpenAIError：openai 库所有错误的基类
 from openai import OpenAI, OpenAIError
+# Vector：pgvector 库的向量类型，内部用紧凑的 4 字节浮点数存储，可以直接写进数据库
+from pgvector import Vector
 
 # 读取配置
 from app.config import settings
@@ -40,11 +42,15 @@ def _client(api_key: str, base_url: str, key_name: str) -> OpenAI:
     )
 
 
-# 把多段文字转换成向量，返回的顺序和输入的顺序一一对应
-def embed_texts(texts: list[str]) -> list[list[float]]:
+# 把多段文字转换成向量，返回的顺序和输入的顺序一一对应。
+# 返回 pgvector 的 Vector 而不是 Python 的 float 列表，是为了省内存：
+#   Python 列表里的每个数都是一个独立的对象，约 32 字节，一个 1024 维的向量约 36KB；
+#   Vector 内部是连续的 4 字节浮点数，只要 4KB。处理一本长小说要上万个向量，差别是几百 MB 和几十 MB。
+#   数据库里的 vector 列本来就是 4 字节浮点数，所以不损失精度
+def embed_texts(texts: list[str]) -> list[Vector]:
     # embedding 用阿里云百炼
     client = _client(settings.dashscope_api_key, settings.embedding_base_url, "DASHSCOPE_API_KEY")
-    vectors: list[list[float]] = []
+    vectors: list[Vector] = []
     try:
         # 每 10 段发一次请求
         for start in range(0, len(texts), EMBED_BATCH_SIZE):
@@ -54,7 +60,8 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
                 dimensions=EMBEDDING_DIM,  # 指定输出 1024 维，必须和数据库的向量列一致
             )
             # 按 index 排序后再取出向量，保证顺序和输入一致（不依赖服务端返回的顺序）
-            vectors.extend(item.embedding for item in sorted(response.data, key=lambda d: d.index))
+            # 每批的结果马上转成紧凑的 Vector，原来的 float 列表随即被释放
+            vectors.extend(Vector(item.embedding) for item in sorted(response.data, key=lambda d: d.index))
     except OpenAIError as e:
         # 把 openai 库的各种错误统一转换成我们自己的错误类型，调用方不用关心底层用的是哪个库
         raise LLMUnavailable(f"embedding failed: {e}") from e
