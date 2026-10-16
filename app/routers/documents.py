@@ -16,8 +16,8 @@ from fastapi import APIRouter, HTTPException, Query, Response, UploadFile, statu
 # IntegrityError：违反数据库约束
 from sqlalchemy.exc import IntegrityError
 
-# 查询函数
-from app import queries
+# 查询函数；文件格式的检查规则
+from app import extract, queries
 # 读取配置（文件大小上限）
 from app.config import settings
 # 依赖：当前用户、数据库会话
@@ -37,10 +37,6 @@ logger = logging.getLogger(__name__)
 # 所有路径以 /documents 开头，Swagger 里归到 "documents" 组
 router = APIRouter(prefix="/documents", tags=["documents"])
 
-# 允许上传的文件扩展名。用集合（set）是因为判断"是否在集合里"非常快
-ALLOWED_EXTENSIONS = {".md", ".txt", ".pdf"}
-
-
 # 读取上传的文件内容，超过大小上限就返回 413
 def _read_limited(file: UploadFile) -> bytes:
     # 最多读"上限 + 1"个字节：如果真的读到了这么多，说明文件超过了上限。
@@ -55,29 +51,16 @@ def _read_limited(file: UploadFile) -> bytes:
     return content
 
 
-# 检查文件类型，返回扩展名（小写）。不支持的类型返回 415
+# 检查文件类型，返回扩展名（小写）。不支持的类型返回 415。
+# 具体规则（支持哪些格式、怎么判断内容和扩展名相符）都在 extract.py 里
 def _check_file_type(filename: str, content: bytes) -> str:
-    # 415 Unsupported Media Type：不支持的文件类型
-    unsupported = HTTPException(
-        status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, "Only .md, .txt and .pdf files are supported"
-    )
     # 取扩展名并转小写，例如 "笔记.MD" -> ".md"
     extension = PurePath(filename).suffix.lower()
-    # 第一步：检查扩展名是否在白名单里
-    if extension not in ALLOWED_EXTENSIONS:
-        raise unsupported
-    # 第二步：检查文件内容是否和扩展名相符。
-    # 只看扩展名不可靠，任何文件都可以被改名成 .pdf。
-    if extension == ".pdf":
-        # PDF 文件的前 5 个字节一定是 "%PDF-"（叫"魔数"，magic number）
-        if not content.startswith(b"%PDF-"):
-            raise unsupported
-    else:
-        # .md 和 .txt 应该是 UTF-8 编码的文本。解码失败说明是二进制文件，或者是 GBK 等其他编码
-        try:
-            content.decode("utf-8")
-        except UnicodeDecodeError:
-            raise unsupported
+    try:
+        extract.validate(extension, content)
+    except extract.UnsupportedFile as e:
+        # 415 Unsupported Media Type：不支持的文件类型。把具体原因告诉用户，方便他们改正
+        raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, str(e)) from e
     return extension
 
 

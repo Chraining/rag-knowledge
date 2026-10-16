@@ -103,10 +103,17 @@ def test_upload_rejects_fake_pdf(client, register_and_login):
     assert r.status_code == 415
 
 
-# 测试：.txt 文件不是 UTF-8 编码（这里是 GBK 编码的中文），返回 415
-def test_upload_rejects_non_utf8_text(client, register_and_login):
+# 测试：GBK 编码的中文 .txt 也能上传（老的中文 Windows 程序常用这种编码）
+def test_upload_accepts_gbk_text(client, register_and_login):
     headers = register_and_login("alice")
     r = upload(client, headers, "gbk.txt", "中文".encode("gbk"), "text/plain")
+    assert r.status_code == 201
+
+
+# 测试：改了后缀的二进制文件（这里是 PNG 图片的开头），返回 415
+def test_upload_rejects_binary_as_text(client, register_and_login):
+    headers = register_and_login("alice")
+    r = upload(client, headers, "image.txt", b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR", "text/plain")
     assert r.status_code == 415
 
 

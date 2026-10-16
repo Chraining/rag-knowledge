@@ -80,8 +80,8 @@
       <p>当前用户：<b id="me"></b> <button onclick="logout()">退出</button></p>
 
       <h3>我的文档</h3>
-      <!-- 选择文件的控件，只允许选 .md .txt .pdf -->
-      <input id="file" type="file" accept=".md,.txt,.pdf">
+      <!-- 选择文件的控件，只允许选支持的格式（和后端 app/extract.py 里的 ALLOWED_EXTENSIONS 一致） -->
+      <input id="file" type="file" accept=".md,.txt,.pdf,.docx,.pptx,.xlsx,.csv,.html,.htm">
       <!-- 点击后调用 upload() -->
       <button onclick="upload()">上传</button>
       <!-- 上传出错时显示在这里 -->

@@ -17,16 +17,11 @@
 
 # hashlib：重新计算文件哈希，检查文件有没有损坏
 import hashlib
-# io：把 bytes 包装成"像文件一样可以读取的对象"，pypdf 需要这种对象
-import io
 # datetime、UTC：记录处理完成的时间（带时区）
 from datetime import UTC, datetime
 # PurePath：从路径字符串里取扩展名
 from pathlib import PurePath
 
-# PdfReader：读取 PDF；PyPdfError：pypdf 所有错误的基类（文件损坏等）
-from pypdf import PdfReader
-from pypdf.errors import PyPdfError
 # delete：构造 DELETE 语句；select：构造 SELECT 语句；update：构造 UPDATE 语句
 from sqlalchemy import delete, select, update
 # Session：数据库会话的类型
@@ -34,6 +29,8 @@ from sqlalchemy.orm import Session
 
 # 调用 embedding 服务。写成 from app import llm 再用 llm.embed_texts，测试才能把它替换成假的
 from app import llm
+# 提取文字、永久性错误、表格类格式。PermanentError 和 extract_text 也通过这个模块对外提供（tasks.py 和测试在用）
+from app.extract import TABLE_EXTENSIONS, PermanentError, extract_text
 # 模型
 from app.models import Chunk, Document, DocumentStatus
 # 读取磁盘上的文件
@@ -45,35 +42,6 @@ CHUNK_SIZE = 500
 # 为什么要重叠：如果一句话正好被切在两段的边界上，两段各拿到半句，检索时哪段都匹配不好；
 # 重叠一部分，边界附近的内容会同时出现在两段里
 CHUNK_OVERLAP = 50
-
-
-# "永久性错误"：文件内容本身有问题（损坏的 PDF、扫描件提取不出文字等）。
-# 这类错误重试多少次结果都一样，所以不重试，直接标记为 failed。
-# 和它相对的是"临时性错误"（数据库短暂断开、磁盘忙等），那种值得重试，见 tasks.py
-class PermanentError(Exception):
-    pass  # 不需要额外内容，只是用类名来区分错误类型
-
-
-# 从文件内容里提取纯文本
-def extract_text(content: bytes, extension: str) -> str:
-    # .md 和 .txt：上传时已经检查过是 UTF-8，直接解码
-    if extension != ".pdf":
-        text = content.decode("utf-8")
-    else:
-        try:
-            # 把 bytes 包装成文件对象，交给 pypdf 解析
-            reader = PdfReader(io.BytesIO(content))
-            # 有密码的 PDF 读不出内容
-            if reader.is_encrypted:
-                raise PermanentError("PDF is encrypted")
-            # 逐页提取文字，页与页之间用空行隔开。
-            # extract_text() 在某些页上可能返回 None，用 "or ''" 换成空字符串
-            text = "\n\n".join(page.extract_text() or "" for page in reader.pages)
-        except PyPdfError as e:
-            # 文件头是 %PDF-，但内容损坏，pypdf 解析失败。from e：保留原始错误，方便排查
-            raise PermanentError(f"Cannot parse PDF: {e}") from e
-    # PostgreSQL 的 text 类型不能存空字符（\x00），而 PDF 提取出的文字里偶尔会有，必须去掉
-    return text.replace("\x00", "")
 
 
 # 把长文本切成多段，相邻两段有重叠
@@ -93,6 +61,33 @@ def split_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
         # 这一段已经到了文本末尾，后面不用再切了（否则最后会多出一段完全被包含的小尾巴）
         if start + size >= len(text):
             break
+    return chunks
+
+
+# 表格专用的切分：按整行装进每一段，一行不会被从中间切断。
+# 每一行都带着列名（见 extract.rows_to_lines），所以不需要重叠，任何一段单独拿出来都看得懂。
+# 例如 size=10，行 "aaaa"、"bbbb"、"cccc" → "aaaa\nbbbb"、"cccc"
+def split_lines(text: str, size: int = CHUNK_SIZE) -> list[str]:
+    chunks: list[str] = []
+    # 正在装的这一段
+    current = ""
+    for line in text.splitlines():
+        # 单独一行就超过了长度上限（比如某个单元格里有一大段文字）：先收起当前段，这一行按普通方式切
+        if len(line) > size:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.extend(split_text(line, size))
+        # 加上这一行会超长：当前段装满了，收起来，这一行作为新一段的开头
+        elif current and len(current) + 1 + len(line) > size:
+            chunks.append(current)
+            current = line
+        # 还装得下：接在后面（+1 是换行符）
+        else:
+            current = f"{current}\n{line}" if current else line
+    # 最后一段
+    if current:
+        chunks.append(current)
     return chunks
 
 
@@ -129,10 +124,13 @@ def read_and_split(doc: Document) -> list[str]:
         raise PermanentError("File content does not match its hash")
     # 取扩展名（例如 ".pdf"），决定用哪种方式提取文字。存储路径里的扩展名是上传时校验过的
     extension = PurePath(doc.storage_path).suffix
-    chunks = split_text(extract_text(content, extension))
-    # 一段文字都没有：通常是扫描版 PDF（每页都是图片），需要 OCR 才能识别，目前不支持
+    text = extract_text(content, extension)
+    # 表格按整行切，其他按字数切
+    chunks = split_lines(text) if extension in TABLE_EXTENSIONS else split_text(text)
+    # 一段文字都没有：通常是扫描版 PDF（每页都是图片，需要 OCR 才能识别，目前不支持），
+    # 或者是只有图片、没有文字的 Word / PPT
     if not chunks:
-        raise PermanentError("No text could be extracted (scanned PDF?)")
+        raise PermanentError("No text could be extracted (scanned PDF or images only?)")
     return chunks
 
 
