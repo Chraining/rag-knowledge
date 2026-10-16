@@ -44,11 +44,11 @@ class Settings(BaseSettings):
     # 格式：redis://主机:端口/库编号。Redis 默认有 16 个库（0-15），这里用 0 号
     # 写 127.0.0.1 而不是 localhost：Windows 会把 localhost 先解析成 IPv6 的 ::1，
     # 而 Docker 里的 Redis 只监听 IPv4，每次新建连接都要白等约 2 秒才退回到 IPv4（实测）
-    celery_broker_url: str = "redis://127.0.0.1:6379/0"
+    celery_broker_url: str = "redis://127.0.0.1:6380/0"
 
     # ---------- Redis（配额计数、缓存） ----------
     # 和 Celery 用同一个 Redis，但用 1 号库，和任务队列的数据分开，互不干扰
-    redis_url: str = "redis://127.0.0.1:6379/1"
+    redis_url: str = "redis://127.0.0.1:6380/1"
 
     # ---------- LLM 和 embedding ----------
     # 两家服务都提供"OpenAI 兼容"接口，所以都用 openai 这个 Python 库调用，只是地址、key、模型名不同。

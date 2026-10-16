@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 # 导入各个路由模块
-from app.routers import auth, chat, conversations, documents
+from app.routers import auth, chat, conversations, documents, health
 
 # 前端文件夹的位置：项目根目录下的 frontend/。
 # 用 __file__（本文件的路径）推算，而不是写相对路径，这样不管从哪个目录启动都能找到
@@ -27,6 +27,7 @@ app.include_router(auth.router)
 app.include_router(documents.router)
 app.include_router(chat.router)
 app.include_router(conversations.router)
+app.include_router(health.router)
 
 # 前端页面：打开 http://127.0.0.1:8000/ 就会返回 frontend/index.html。
 # 必须放在所有接口的后面：挂在 "/" 上会匹配所有路径，FastAPI 按注册顺序匹配，

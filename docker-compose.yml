@@ -1,23 +1,78 @@
-# 开发环境依赖的服务：PostgreSQL（带 pgvector 扩展）和 Redis。
-# 启动：docker compose up -d      停止：docker compose stop
-# 应用本身和 worker 仍然在本机用 uv run 启动；阶段 5 会把它们也加进来。
+# 整个系统的四个服务：应用（API）、worker（后台任务）、PostgreSQL（带 pgvector 扩展）、Redis。
+# 全部启动：docker compose up -d --build     （--build：代码改过就重新构建镜像）
+# 看日志：  docker compose logs -f app worker
+# 停止：    docker compose stop
+# 开发时也可以只启动数据库：docker compose up -d postgres redis，应用和 worker 仍然在本机用 uv run 启动
+
+# 应用和 worker 共用的配置。x- 开头的字段 Docker 会忽略，只是给下面引用用的。
+# &app-common 给这段配置起个名字，下面用 <<: *app-common 把它"粘贴"进去，避免写两遍
+x-app-common: &app-common
+  # 用项目根目录的 Dockerfile 构建镜像
+  build: .
+  # 从 .env 读取环境变量（API key、JWT 密钥等）。密钥不打包进镜像，运行时才传进容器
+  env_file: .env
+  # 这几项覆盖 .env 里的值：在容器里，127.0.0.1 指的是容器自己，
+  # 要用服务名（postgres、redis）访问其他容器，用容器内部的端口（5432，不是本机映射出来的 5433）
+  environment:
+    DATABASE_URL: postgresql+psycopg://rag:rag@postgres:5432/rag
+    CELERY_BROKER_URL: redis://redis:6379/0
+    REDIS_URL: redis://redis:6379/1
+  volumes:
+    # 上传的文件存在 uploads 卷里。应用写入、worker 读取，两个容器必须挂载同一个卷，
+    # 否则 worker 找不到应用保存的文件，每个文档都会处理失败
+    - uploads:/data/storage
+  depends_on:
+    # 等数据库和 Redis 真正可用（健康检查通过）之后再启动，而不只是等它们的容器启动
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped  # 崩溃了自动重启，除非手动停止过
+
 services:
+  app:
+    <<: *app-common
+    ports:
+      # 只绑定 127.0.0.1：只有本机能访问。部署到服务器后，由 nginx 对外，应用本身不直接暴露
+      - "127.0.0.1:8000:8000"
+    # 健康检查：每 30 秒调用一次 /health，连续 3 次失败就标记为 unhealthy。
+    # 镜像里没有 curl，所以用 Python 自带的 urllib 发请求；返回 503 时 urlopen 会抛异常，命令就算失败
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s  # 启动后的前 20 秒（执行迁移、加载代码）失败不算数
+
+  worker:
+    <<: *app-common
+    # 同一个镜像，换一个启动命令。在 Linux 容器里不需要 Windows 才要的 --pool=solo，
+    # 用 Celery 默认的多进程模式；--concurrency=2：同时处理 2 个文档
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=2
+
   postgres:
     # 官方 PostgreSQL 18 镜像 + 预装好的 pgvector 扩展
     image: pgvector/pgvector:pg18
     environment:
       POSTGRES_USER: rag  # 用户名
-      POSTGRES_PASSWORD: rag  # 密码（只用于本机开发）
+      POSTGRES_PASSWORD: rag  # 密码（只用于本机开发，部署到服务器前要换成强密码）
       POSTGRES_DB: rag  # 自动创建的开发库
     ports:
       # 只绑定 127.0.0.1：只有本机能连，局域网里的其他机器连不上。
-      # 用 5433 而不是 5432：5432 已经被你本机安装的 PostgreSQL 占用了
+      # 用 5433 而不是 5432：5432 已经被你本机安装的 PostgreSQL 占用了。
+      # 这个端口只给本机直接运行的程序（测试、uv run）用，容器之间走 Docker 内部网络，不经过它
       - "127.0.0.1:5433:5432"
     volumes:
       # 数据存在 Docker 卷里，删掉容器数据也还在。PG18 镜像要求挂载到 /var/lib/postgresql
       - pgdata:/var/lib/postgresql
       # 第一次启动时执行的建库脚本
       - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    # 健康检查：pg_isready 是 PostgreSQL 自带的工具，检查数据库能不能接受连接
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "rag", "-d", "rag"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped  # Docker 启动时自动启动，除非手动停止过
 
   redis:
@@ -25,12 +80,21 @@ services:
     # --appendonly yes：把每次写操作记到磁盘上，重启后队列里的任务不会丢
     command: redis-server --appendonly yes
     ports:
-      - "127.0.0.1:6379:6379"
+      # 本机用 6380 而不是 6379：6379 被本机的代理软件（Clash Verge）占用了。
+      # 容器之间仍然用 redis:6379，只有本机直接运行的程序（uv run）才走这个 6380
+      - "127.0.0.1:6380:6379"
     volumes:
       - redisdata:/data
+    # 健康检查：redis-cli ping，正常会回 PONG
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
-# 上面用到的两个数据卷
+# 上面用到的数据卷
 volumes:
   pgdata:
   redisdata:
+  uploads:

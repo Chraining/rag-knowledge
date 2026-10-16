@@ -1,0 +1,21 @@
+# 构建镜像时不发送给 Docker 的文件（和 .gitignore 类似）。
+# 好处：构建更快、镜像更小，而且密钥和本地数据不会被打包进镜像
+
+# 密钥：绝不能进镜像。镜像可能会被推到镜像仓库，谁拿到镜像谁就能看到里面的文件。
+# 容器运行时的密钥由 docker-compose.yml 的 env_file 传进去
+.env
+
+# 本机的虚拟环境：里面是 Windows 版的程序，Linux 容器里用不了，镜像里会重新安装
+.venv
+
+# 本机上传的文件（容器用自己的存储卷）
+storage
+
+# 运行时用不到的东西
+.git
+.pytest_cache
+**/__pycache__
+tests
+docs
+playground
+*.md
