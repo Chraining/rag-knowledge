@@ -1,0 +1,45 @@
+# GitHub Actions：每次推送代码或提交 Pull Request 时，GitHub 自动在一台临时的 Linux 机器上跑全部测试。
+# 测试不通过，GitHub 上这次提交旁边会显示红叉，一眼就能看出"这次改动把东西改坏了"。这就是 CI（持续集成）
+name: tests
+
+# 什么时候触发：推送到任意分支、提交 Pull Request
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    # 在 GitHub 提供的最新版 Ubuntu 机器上运行
+    runs-on: ubuntu-latest
+
+    # 服务容器：和测试一起启动的数据库，相当于 docker-compose.yml 里的 postgres。
+    # 测试用 fakeredis，不需要真的 Redis；调用 AI 的地方也换成了假的，不需要 API key
+    services:
+      postgres:
+        # 和 docker-compose.yml 用同一个镜像（带 pgvector 扩展的 PostgreSQL）
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_USER: rag
+          POSTGRES_PASSWORD: rag
+          # 直接建测试库 rag_test（本地是由 docker/postgres-init.sql 建的）
+          POSTGRES_DB: rag_test
+        # 映射到 5433：和 app/config.py 里 test_database_url 的默认值一致，不用另外配置
+        ports:
+          - 5433:5432
+        # 等数据库真正可以连接了，再开始跑后面的步骤
+        options: >-
+          --health-cmd "pg_isready -U rag"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      # 第 1 步：把仓库代码下载到这台机器上
+      - uses: actions/checkout@v4
+      # 第 2 步：安装 uv（和本地开发用的同一个包管理工具）
+      - uses: astral-sh/setup-uv@v6
+      # 第 3 步：按 uv.lock 安装 Python 和所有依赖（包括 pytest 等开发依赖）。
+      # --frozen：严格按锁文件安装，和本地的版本完全一致
+      - run: uv sync --frozen
+      # 第 4 步：跑全部测试。任何一个测试失败，这一步就失败，整次运行显示红叉
+      - run: uv run pytest -q
