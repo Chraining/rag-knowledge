@@ -313,8 +313,8 @@
         const data = await api("/chat", { method: "POST", json: { question, conversation_id: conversationId } });
         // 记住会话 id，下一次提问就是追问
         conversationId = data.conversation_id;
-        // 显示回答和来源（文件名 + 相似度）
-        addMessage("assistant", data.answer, data.sources.map((s) => `${s.filename}（${s.score}）`));
+        // 显示回答和来源（文件名 + 相似度；通读文档得到的来源没有相似度，只显示文件名）
+        addMessage("assistant", data.answer, data.sources.map((s) => (s.score === null ? s.filename : `${s.filename}（${s.score}）`)));
         // 刷新会话列表（新会话会出现在最上面）
         await loadConversations();
       } catch (e) {

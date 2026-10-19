@@ -2,8 +2,9 @@
 # fixture（测试夹具）= 测试运行前的"准备工作"，比如连好数据库、造好测试用户。
 # 测试函数只要在参数里写上 fixture 的名字（如 db），pytest 就会自动把准备好的东西传进来。
 
-# hashlib、re：假 embedding 里用来切词和哈希
+# hashlib、re：假 embedding 里用来切词和哈希；json：生成假的工具参数
 import hashlib
+import json
 import re
 
 # fakeredis：在内存里模拟 Redis 的库
@@ -153,9 +154,11 @@ def fake_embedding(text: str) -> list[float]:
 class FakeLLM:
     def __init__(self):
         self.embedded: list[str] = []  # 被转换成向量的所有文字
-        self.chat_calls: list[list[dict]] = []  # 每次 chat 调用收到的消息
+        self.chat_calls: list[list[dict]] = []  # 每次 chat 调用收到的消息（复制一份，不受后续追加影响）
         self.fail = False  # 设成 True 后，所有调用都抛 LLMUnavailable，模拟服务挂了
-        self.answer = "fake answer"  # chat 返回的固定回答
+        self.answer = "fake answer"  # 最终回答的固定开头
+        # 预先写好的回复，按顺序一个个返回，用来测试"模型调用了某个工具"等情况。用完后恢复默认行为
+        self.script: list[llm.ChatReply] = []
 
     # 和真实的 llm.embed_texts 一样返回 Vector
     def embed_texts(self, texts: list[str]) -> list[Vector]:
@@ -164,11 +167,24 @@ class FakeLLM:
         self.embedded.extend(texts)
         return [Vector(fake_embedding(t)) for t in texts]
 
-    def chat(self, messages: list[dict]) -> tuple[str, int]:
+    # 默认行为模拟一个"最简单的 Agent"：
+    #   第 1 轮：用用户的问题调用一次 search_documents
+    #   第 2 轮：回答 "fake answer"，并引用检索结果里的所有编号（例如 "fake answer [1][2]"）
+    def chat(self, messages: list[dict], tools: list[dict] | None = None, allow_tools: bool = True) -> llm.ChatReply:
         if self.fail:
             raise llm.LLMUnavailable("fake outage")
-        self.chat_calls.append(messages)
-        return self.answer, 42  # 固定返回 42 个 token
+        self.chat_calls.append(list(messages))
+        if self.script:
+            return self.script.pop(0)
+        # 这次提问里的工具结果（最后一条 user 消息之后的 role=tool 消息）
+        last_user = max(i for i, m in enumerate(messages) if m["role"] == "user")
+        results = [m["content"] for m in messages[last_user:] if m["role"] == "tool"]
+        if not results:
+            call = llm.ToolCall("call-1", "search_documents", json.dumps({"query": messages[last_user]["content"]}))
+            return llm.ChatReply("", [call], 10)
+        # 工具结果里每段开头的编号，例如 "[1] （来自 a.md，文档 id=3）"
+        numbers = re.findall(r"^\[(\d+)\]", "\n".join(results), flags=re.MULTILINE)
+        return llm.ChatReply(self.answer + "".join(f" [{n}]" for n in numbers), [], 42)
 
 
 # 每个测试自动把真正的 AI 服务换成假的：测试不联网、不花钱、结果固定。

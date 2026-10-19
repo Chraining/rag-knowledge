@@ -102,7 +102,7 @@ class SourceOut(BaseModel):
     chunk_id: int  # 段落 id
     document_id: int  # 文档 id
     filename: str  # 文件名
-    score: float  # 相似度，越接近 1 越相关
+    score: float | None  # 相似度，越接近 1 越相关；通读文档得到的段落没有相似度，为 null
     snippet: str  # 段落开头的一部分，方便用户看出引用的是哪里
 
 

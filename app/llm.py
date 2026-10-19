@@ -9,6 +9,9 @@
 #   3. 降级：重试完还是失败，统一抛出 LLMUnavailable，由调用方决定怎么"体面地失败"
 #      （问答接口返回 503 友好提示；后台任务交给 Celery 再重试）
 
+# dataclass：自动生成 __init__ 的装饰器，用来定义只装数据的小类
+from dataclasses import dataclass
+
 # OpenAI：客户端类；OpenAIError：openai 库所有错误的基类
 from openai import OpenAI, OpenAIError
 # Vector：pgvector 库的向量类型，内部用紧凑的 4 字节浮点数存储，可以直接写进数据库
@@ -68,17 +71,41 @@ def embed_texts(texts: list[str]) -> list[Vector]:
     return vectors
 
 
-# 让大模型根据对话消息生成回答。返回 (回答内容, 消耗的 token 数)
-# messages 的格式：[{"role": "system"/"user"/"assistant", "content": "..."}, ...]
-def chat(messages: list[dict[str, str]]) -> tuple[str, int]:
+# 模型要调用的一个工具
+@dataclass
+class ToolCall:
+    id: str  # 这次调用的编号，返回工具结果时要带上，模型才知道是哪次调用的结果
+    name: str  # 工具名，例如 "search_documents"
+    arguments: str  # 参数，是一个 JSON 字符串（模型生成的，可能格式不对），由调用方解析
+
+
+# 大模型的一次回复：要么是回答（content），要么是要调用的工具（tool_calls 不为空）
+@dataclass
+class ChatReply:
+    content: str  # 回答内容；调用工具时通常为空
+    tool_calls: list[ToolCall]  # 要调用的工具，可以一次调用多个
+    tokens: int  # 这次调用消耗的 token 数（输入 + 输出），用于统计用量和费用
+
+
+# 让大模型根据对话消息生成回复。
+# messages 的格式：[{"role": "system"/"user"/"assistant"/"tool", "content": "..."}, ...]
+# tools：可供模型调用的工具说明（OpenAI 的 function calling 格式），不传就是普通对话。
+# allow_tools=False：工具说明照样发送（对话里已经有工具调用记录，去掉说明有的服务会报错），
+#   但要求模型这次必须直接回答，不能再调用工具
+def chat(messages: list[dict], tools: list[dict] | None = None, allow_tools: bool = True) -> ChatReply:
     # 回答用 DeepSeek
     client = _client(settings.deepseek_api_key, settings.chat_base_url, "DEEPSEEK_API_KEY")
+    # tool_choice="auto"：模型自己决定调不调用工具；"none"：不许调用
+    extra = {"tools": tools, "tool_choice": "auto" if allow_tools else "none"} if tools else {}
     try:
-        response = client.chat.completions.create(model=settings.chat_model, messages=messages)
+        response = client.chat.completions.create(model=settings.chat_model, messages=messages, **extra)
     except OpenAIError as e:
         raise LLMUnavailable(f"chat failed: {e}") from e
-    # 取第一个候选回答。content 理论上可能是 None，用 or "" 兜底
-    answer = response.choices[0].message.content or ""
-    # usage 里记录了这次调用消耗的 token 数（输入 + 输出），用于统计用量和费用
+    # 取第一个候选回复
+    message = response.choices[0].message
+    # 模型要调用的工具。没有调用工具时 tool_calls 是 None，用 or [] 兜底
+    calls = [ToolCall(c.id, c.function.name, c.function.arguments) for c in message.tool_calls or []]
+    # usage 里记录了这次调用消耗的 token 数
     tokens = response.usage.total_tokens if response.usage else 0
-    return answer, tokens
+    # content 可能是 None（只调用工具时），用 or "" 兜底
+    return ChatReply(message.content or "", calls, tokens)

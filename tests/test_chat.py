@@ -86,12 +86,14 @@ def test_first_question_creates_conversation(client, db, register_and_login, enq
     r = ask(client, headers, "where does green tea come from?")
     assert r.status_code == 200
     body = r.json()
-    assert body["answer"] == "fake answer"
+    # 假的模型引用了检索到的第 1 段
+    assert body["answer"] == "fake answer [1]"
     assert body["sources"][0]["document_id"] == doc_id
     assert body["sources"][0]["snippet"] == "green tea comes from china"
-    # 发给 LLM 的最后一条消息里，包含检索到的资料和问题
-    prompt = fake_llm.chat_calls[0][-1]["content"]
-    assert "green tea comes from china" in prompt and "where does green tea come from?" in prompt
+    # 第 1 轮：问题是最后一条消息；第 2 轮：最后一条是检索工具的结果，里面有带编号的资料
+    assert fake_llm.chat_calls[0][-1]["content"] == "where does green tea come from?"
+    tool_result = fake_llm.chat_calls[1][-1]
+    assert tool_result["role"] == "tool" and "[1] （来自 tea.md" in tool_result["content"]
     # 数据库：会话标题取自问题，里面有一问一答两条消息
     conversation = db.get(Conversation, body["conversation_id"])
     assert conversation.title == "where does green tea come from?"
@@ -107,8 +109,9 @@ def test_follow_up_sends_history(client, db, register_and_login, enqueued, fake_
     conversation_id = ask(client, headers, "where does green tea come from?").json()["conversation_id"]
     # 追问要和文档有足够多相同的词，否则相似度低于分数线，不会调用 LLM
     ask(client, headers, "where does black tea come from?", conversation_id)
-    second_call = fake_llm.chat_calls[1]
-    # 消息顺序：系统提示词、上一轮的提问、上一轮的回答、这次的问题
+    # 每次提问调用 2 次模型（检索、回答），所以第二个问题的第一次调用是 chat_calls[2]
+    second_call = fake_llm.chat_calls[2]
+    # 消息顺序：系统提示词、上一轮的提问、上一轮的回答、这次的问题。历史里不含上一轮的工具调用过程
     assert [m["role"] for m in second_call] == ["system", "user", "assistant", "user"]
     assert second_call[1]["content"] == "where does green tea come from?"
     # 同一个会话里现在有 4 条消息
@@ -125,7 +128,7 @@ def test_cannot_use_other_users_conversation(client, db, register_and_login, enq
     assert client.delete(f"/conversations/{bobs_conversation}", headers=alice).status_code == 404
 
 
-# 测试：相似度低于分数线的段落不算来源；全都不相关时，直接返回固定回答，不调用 LLM
+# 测试：相似度低于分数线的段落不算来源；全都不相关时，检索工具告诉模型"没有找到"
 def test_irrelevant_chunks_are_dropped(client, db, register_and_login, enqueued, fake_llm):
     headers = register_and_login("alice")
     add_ready_doc(client, db, headers, enqueued, "tea.md", "green tea comes from china")
@@ -134,16 +137,14 @@ def test_irrelevant_chunks_are_dropped(client, db, register_and_login, enqueued,
     assert [s["filename"] for s in r.json()["sources"]] == ["tea.md"]
     r = ask(client, headers, "what is the python gil")
     assert r.json()["sources"] == []
-    # 只有第一个问题调用了 LLM
-    assert len(fake_llm.chat_calls) == 1
+    assert fake_llm.chat_calls[-1][-1]["content"] == "没有找到相关段落。"
 
 
-# 测试：没有可检索的文档时，直接返回固定回答，不调用 LLM（省钱）
-def test_no_documents_skips_llm(client, register_and_login, fake_llm):
+# 测试：没有可检索的文档时，回答没有来源
+def test_no_documents_gives_no_sources(client, register_and_login, fake_llm):
     headers = register_and_login("alice")
     r = ask(client, headers, "anything?")
-    assert r.json()["answer"] == "在你的文档里没有找到相关内容。如果刚上传了文档，请等它处理完成（状态变为 ready）后再提问。"
-    assert fake_llm.chat_calls == []
+    assert r.json() == {"conversation_id": r.json()["conversation_id"], "answer": "fake answer", "sources": []}
 
 
 # 测试：会话列表按最近活跃排序；往旧会话里追问后，它会排到最前面（updated_at 被更新）
@@ -180,7 +181,8 @@ def test_quota_exceeded_returns_429(client, db, register_and_login, enqueued, fa
     assert ask(client, headers, "notes 1").status_code == 200
     assert ask(client, headers, "notes 2").status_code == 200
     assert ask(client, headers, "notes 3").status_code == 429
-    assert len(fake_llm.chat_calls) == 2
+    # 前两个问题各调用 2 次模型，第三个问题一次都没有调用
+    assert len(fake_llm.chat_calls) == 4
 
 
 # 测试：配额是按用户分开算的，alice 用完了不影响 bob

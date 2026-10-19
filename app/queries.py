@@ -207,11 +207,14 @@ class RetrievedChunk:
     document_id: int  # 所属文档 id
     filename: str  # 所属文档的文件名，展示来源时用
     content: str  # 段落内容，拼进给 LLM 的提示词里
-    score: float  # 相似度，1 表示完全相同，越小越不相关
+    score: float | None  # 相似度，1 表示完全相同，越小越不相关；按顺序读取（不是检索）的段落没有相似度，为 None
 
 
-# 向量检索：在这个用户"已处理完成"的文档里，找出和问题向量最相似的 top_k 段
-def search_chunks(db: Session, user_id: int, query_vector: list[float], top_k: int) -> list[RetrievedChunk]:
+# 向量检索：在这个用户"已处理完成"的文档里，找出和问题向量最相似的 top_k 段。
+# 传了 document_id 就只在这一个文档里找
+def search_chunks(
+    db: Session, user_id: int, query_vector: list[float], top_k: int, document_id: int | None = None
+) -> list[RetrievedChunk]:
     # 多用户场景下 HNSW 索引的一个坑：
     #   索引是所有用户共用的。默认情况下，索引只先找出全局最相似的 40 个段落，再按 WHERE 条件过滤。
     #   如果这 40 个都是别人的，过滤完一个都不剩，这个用户就搜不到任何结果，哪怕他的文档里有答案。
@@ -234,8 +237,29 @@ def search_chunks(db: Session, user_id: int, query_vector: list[float], top_k: i
         .order_by(distance)
         .limit(top_k)
     )
+    # 限定文档：在上面的条件基础上再加一个条件（权限过滤仍然在，传别人的文档 id 什么也查不到）
+    if document_id is not None:
+        stmt = stmt.where(Chunk.document_id == document_id)
     return [
         # 相似度 = 1 - 余弦距离，更直观：越大越相似
         RetrievedChunk(chunk_id, document_id, filename, content, 1 - dist)
         for chunk_id, document_id, filename, content, dist in db.execute(stmt)
     ]
+
+
+# 按顺序读取某个文档的前 limit 段（"通读"一个文档，不是检索）
+def list_chunks(db: Session, user_id: int, document_id: int, limit: int) -> list[RetrievedChunk]:
+    stmt = (
+        select(Chunk.id, Chunk.document_id, Document.filename, Chunk.content)
+        .join(Document, Chunk.document_id == Document.id)
+        .where(
+            Chunk.document_id == document_id,
+            Document.user_id == user_id,  # 权限过滤：只能读自己的文档
+            Document.status == DocumentStatus.READY,  # 只读处理完成的文档
+        )
+        # 按段落在文档里的顺序
+        .order_by(Chunk.chunk_index)
+        .limit(limit)
+    )
+    # 不是检索出来的，没有相似度
+    return [RetrievedChunk(chunk_id, doc_id, filename, content, None) for chunk_id, doc_id, filename, content in db.execute(stmt)]
