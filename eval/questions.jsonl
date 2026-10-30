@@ -1,0 +1,52 @@
+{"question": "E117 是什么故障？", "answer": "E117 IP 地址冲突", "type": "keyword"}
+{"question": "路由器报 E171 怎么处理？", "answer": "E171 DHCP 地址池已满", "type": "keyword"}
+{"question": "办公室设备越来越多，新接入的电脑拿不到地址了，怎么解决？", "answer": "E171 DHCP 地址池已满", "type": "semantic"}
+{"question": "E501 是什么意思？", "answer": "E501 管理员账号连续 5 次登录失败", "type": "keyword"}
+{"question": "路由器后台密码输错太多次进不去了，怎么办？", "answer": "E501 管理员账号连续 5 次登录失败", "type": "semantic"}
+{"question": "E301 故障代码代表什么？", "answer": "E301 固件校验失败", "type": "keyword"}
+{"question": "升级时突然停电，路由器开不了机了，怎么救？", "answer": "按住 RESET 孔开机进入救援模式", "type": "semantic"}
+{"question": "E202 怎么解决？", "answer": "E202 无线信道干扰严重", "type": "keyword"}
+{"question": "XR-300 最多能连多少台设备？", "answer": "最大带机量 128 台", "type": "keyword"}
+{"question": "XR-500 有几个光口？", "answer": "2 个 10G 光口", "type": "keyword"}
+{"question": "我们公司想要两路供电互为备份的路由器，该选哪一款？", "answer": "支持双电源冗余", "type": "semantic"}
+{"question": "路由器怎么恢复成刚买来时的状态？", "answer": "按住机身背面的 RESET 孔 10 秒以上", "type": "semantic"}
+{"question": "第一次配置路由器，管理页面的网址是什么？", "answer": "在浏览器打开 192.168.10.1", "type": "semantic"}
+{"question": "路由器上连外网的那个灯一直是橙色，是怎么回事？", "answer": "橙色表示网线已连接但未获取到 IP 地址", "type": "semantic"}
+{"question": "XR-200 的最新固件版本号是多少？", "answer": "XR-200 最新固件为 V2.4.1", "type": "keyword"}
+{"question": "给来访客人开的那个无线网络有没有限速？", "answer": "默认限速 20 Mbps", "type": "semantic"}
+{"question": "SW-24P 的零售价是多少？", "answer": "型号: SW-24P,", "type": "keyword"}
+{"question": "我们卖的监控摄像头经销价多少钱？", "answer": "型号: CAM-20", "type": "semantic"}
+{"question": "FW-300 保修多久？", "answer": "型号: FW-300", "type": "keyword"}
+{"question": "交换机怎么恢复出厂设置？", "answer": "按住前面板的 RST 按钮 5 秒", "type": "semantic"}
+{"question": "交换机有个网口的灯一直慢慢闪，网络也不通，是什么情况？", "answer": "LINK 灯以 1 秒间隔慢闪", "type": "semantic"}
+{"question": "SW-24P 的 PoE 总功率是多少？", "answer": "PoE 总功率 370W", "type": "keyword"}
+{"question": "工作满 5 年了，一年能休几天年假？", "answer": "累计工龄满 1 年不满 10 年的，年假 5 天", "type": "semantic"}
+{"question": "生病请假期间工资怎么算？", "answer": "工资按 80% 发放", "type": "semantic"}
+{"question": "结婚能休几天假？", "answer": "婚假 13 天", "type": "semantic"}
+{"question": "老婆生孩子，我能请几天假？", "answer": "陪产假 15 天", "type": "semantic"}
+{"question": "周末来公司干活，钱怎么算？", "answer": "休息日加班无法调休的，按 200% 支付加班费", "type": "semantic"}
+{"question": "转正之后想辞职，需要提前多久说？", "answer": "转正后须提前 30 天", "type": "semantic"}
+{"question": "试用期能拿多少工资？", "answer": "试用期工资为转正工资的 90%", "type": "semantic"}
+{"question": "去年没休完的年假今年还能用吗？", "answer": "顺延至次年 3 月 31 日", "type": "semantic"}
+{"question": "我是 P7，去上海出差住酒店一晚能报多少？", "answer": "P6 至 P8 员工：一类城市 700 元", "type": "semantic"}
+{"question": "出差吃饭公司给补贴吗？", "answer": "每天餐补 120 元", "type": "semantic"}
+{"question": "坐高铁要七个多小时，能不能改坐飞机？", "answer": "单程高铁时间超过 6 小时的，可以乘坐飞机经济舱", "type": "semantic"}
+{"question": "开发票用的公司税号是多少？", "answer": "91330106MA2KQ7XU5L", "type": "semantic"}
+{"question": "报销的钱什么时候到账？", "answer": "报销款每周四统一打款", "type": "semantic"}
+{"question": "三个多月前的发票还能报销吗？", "answer": "超过 90 天的不予报销", "type": "semantic"}
+{"question": "VPN 的服务器地址填什么？", "answer": "vpn.yunfan-tech.com", "type": "keyword"}
+{"question": "电脑登录密码忘了，怎么找回？", "answer": "id.yunfan-tech.com", "type": "semantic"}
+{"question": "3 楼的打印机叫什么名字？", "answer": "3 楼为 3F-PRINT", "type": "keyword"}
+{"question": "发邮件能带多大的附件？", "answer": "单封邮件附件不超过 50MB", "type": "semantic"}
+{"question": "新员工第一天去哪里领电脑？", "answer": "2 楼 205 室", "type": "semantic"}
+{"question": "IT 服务台的电话是多少？", "answer": "内线 8000", "type": "keyword"}
+{"question": "公司账号的密码有什么要求？", "answer": "域账号密码至少 12 位", "type": "semantic"}
+{"question": "收到可疑的钓鱼邮件应该找谁？", "answer": "1 小时内报告信息安全部", "type": "keyword"}
+{"question": "客户名单属于哪个保密级别？", "answer": "如客户名单、财务报表、源代码", "type": "keyword"}
+{"question": "能把代码拷到 U 盘带回家写吗？", "answer": "禁止拷贝到 U 盘等移动存储设备", "type": "semantic"}
+{"question": "第三季度营收多少？", "answer": "营业收入 1.82 亿元", "type": "semantic"}
+{"question": "XR-600 什么时候发布？", "answer": "XR-600 计划于 2027 年第一季度发布", "type": "keyword"}
+{"question": "推荐朋友来公司上班能拿多少奖励？", "answer": "内推奖金从 3000 元提高到 5000 元", "type": "semantic"}
+{"question": "西南分公司设在哪个城市？", "answer": "批准在成都设立西南分公司", "type": "keyword"}
+{"question": "三季度毛利率为什么下降了？", "answer": "芯片采购成本上涨", "type": "semantic"}
+{"question": "第二季度应收账款周转天数是多少？", "answer": "应收账款周转天数为 58 天", "type": "keyword"}
