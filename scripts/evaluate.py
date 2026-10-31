@@ -4,7 +4,8 @@
     uv run python -m scripts.evaluate                             # 自建评测集，线上的切分参数（段长 500、重叠 50）
     uv run python -m scripts.evaluate --chunk-size 300            # 换一个段长，和上面的结果对比
     uv run python -m scripts.evaluate --dataset duretrieval       # 公开数据集 DuRetrieval 的子集
-    uv run python -m scripts.evaluate --mode vector               # 只用向量检索，和默认的混合检索对比
+    uv run python -m scripts.evaluate --mode hybrid               # 混合检索（向量 + 关键词），和默认的向量检索对比
+    uv run python -m scripts.evaluate --mode rerank               # 向量检索前 20 段，再用重排序模型排序（调用付费接口）
 
 评测检索效果。用法见上面的命令。
 
@@ -44,8 +45,8 @@ from alembic import command
 from alembic.config import Config
 # Vector：pgvector 的向量列类型（向量缓存表用）
 from pgvector.sqlalchemy import Vector
-# create_engine：连接数据库；select：查询；text：原生 SQL；Table 等：定义向量缓存表
-from sqlalchemy import Column, MetaData, String, Table, create_engine, select, text
+# create_engine：连接数据库；select：查询；text：原生 SQL；Table 等：定义向量缓存表和重排序缓存表
+from sqlalchemy import Column, Float, MetaData, String, Table, create_engine, select, text
 # insert：PostgreSQL 专用的 INSERT，支持 ON CONFLICT DO NOTHING
 from sqlalchemy.dialects.postgresql import insert
 # make_url：解析数据库地址，把其中的库名换成 rag_eval
@@ -81,6 +82,9 @@ DEPTH = 10
 RECALL_AT = (1, 3, 5, 10)
 # 一次调用 embedding 的段数。分批调用只是为了能打印进度（1 万段要几分钟）
 EMBED_PROGRESS_BATCH = 500
+# rerank 模式：先用向量检索取多少段候选，再交给重排序模型。
+# 公开数据集上向量检索前 20 名已经包含 97% 的相关段落，再多取，费用成倍增加，能多找到的很少
+RERANK_CANDIDATES = 20
 # 没进前 5 名的问题最多列出多少个（公开数据集可能有几十个，全列出来太长）
 MAX_MISSES_SHOWN = 20
 
@@ -212,6 +216,34 @@ def embed_all(db: Session, texts: list[str]) -> dict:
     return {t: cached[key] for t, key in keys.items()}
 
 
+# 重排序缓存表，和向量缓存表一样只在评测库里：{模型名 + 问题 + 段落的哈希: 相关度分数}。
+# 每个问题算完就提交：中途失败时已经算好的不会丢；重复运行、换别的评测集再换回来，都不再花钱
+rerank_cache = Table(
+    "rerank_cache",
+    MetaData(),
+    Column("key", String(64), primary_key=True),
+    Column("score", Float),
+)
+
+
+# 给每段打重排序分数，返回的顺序和 chunks 一致。缓存里有的直接读，没有的才调用接口
+def rerank_cached(db: Session, question: str, chunks: list[RetrievedChunk]) -> list[float]:
+    rerank_cache.create(db.connection(), checkfirst=True)
+    # 键里带上模型名和问题：同一段文字，对不同的问题分数不一样
+    keys = [hashlib.sha256(f"{settings.rerank_model}\n{question}\n{c.content}".encode()).hexdigest() for c in chunks]
+    cached = {key: score for key, score in db.execute(select(rerank_cache).where(rerank_cache.c.key.in_(keys)))}
+    # 缓存里没有的段落（dict.fromkeys 去重：同样的键只算一次）
+    missing = [(key, c.content) for key, c in dict(zip(keys, chunks)).items() if key not in cached]
+    if missing:
+        # 只把缺的段落发给模型。重排序模型对每一对（问题, 段落）单独打分，分开发送不影响分数
+        scores = llm.rerank(question, [content for _, content in missing])
+        new = [{"key": key, "score": score} for (key, _), score in zip(missing, scores, strict=True)]
+        db.execute(insert(rerank_cache).on_conflict_do_nothing(), new)
+        db.commit()
+        cached.update((row["key"], row["score"]) for row in new)
+    return [cached[key] for key in keys]
+
+
 # 清空评测库，重新写入全部文档的段落和向量。返回评测用户的 id
 def build_index(db: Session, corpus: dict[str, str], size: int, overlap: int) -> int:
     # 先切好所有文档：[(文档名, 文字, 段落列表), ...]
@@ -252,12 +284,18 @@ def relevant_items(q: Question, chunk: RetrievedChunk) -> set[str]:
     return {chunk.filename} & set(q.relevant)
 
 
-# 用哪种方式检索，前 DEPTH 段。hybrid 就是线上用的方式；vector、keyword 是它的两路，单独测，看各自的贡献
+# 用哪种方式检索，前 DEPTH 段。vector 是线上用的方式；keyword、hybrid、rerank 是试过的改进，和它对比
 def search(db: Session, user_id: int, mode: str, question: str) -> list[queries.RetrievedChunk]:
     # 问题转向量（带缓存），和线上一样
     vector = rag.embed_query(question)
     if mode == "vector":
         return queries.search_chunks(db, user_id, vector, DEPTH)
+    if mode == "rerank":
+        candidates = queries.search_chunks(db, user_id, vector, RERANK_CANDIDATES)
+        scores = rerank_cached(db, question, candidates)
+        # 按重排序分数从高到低重新排列候选
+        order = sorted(range(len(candidates)), key=scores.__getitem__, reverse=True)
+        return [candidates[i] for i in order[:DEPTH]]
     if mode == "keyword":
         return queries.keyword_search_chunks(db, user_id, question, vector, DEPTH)
     return queries.hybrid_search_chunks(db, user_id, question, vector, DEPTH)
@@ -326,7 +364,7 @@ def main() -> None:
     parser.add_argument("--chunk-size", type=int, default=CHUNK_SIZE, help="每段最多多少个字符")
     parser.add_argument("--overlap", type=int, default=CHUNK_OVERLAP, help="相邻两段重叠多少个字符")
     parser.add_argument(
-        "--mode", choices=["hybrid", "vector", "keyword"], default="hybrid", help="检索方式，默认是线上用的混合检索"
+        "--mode", choices=["vector", "keyword", "hybrid", "rerank"], default="vector", help="检索方式，默认是线上用的向量检索"
     )
     parser.add_argument("--check-only", action="store_true", help="只检查标注和切分，不连数据库、不调用 embedding")
     args = parser.parse_args()

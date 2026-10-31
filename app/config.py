@@ -65,6 +65,9 @@ class Settings(BaseSettings):
     dashscope_api_key: str = ""
     embedding_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     embedding_model: str = "text-embedding-v4"
+    # 重排序（rerank）：也用百炼，同一个 key。这个接口不兼容 OpenAI，地址是百炼自己的格式
+    rerank_url: str = "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
+    rerank_model: str = "qwen3-rerank"
     # 一次调用最多等多少秒。超时就当作失败，不让用户的请求一直卡着
     llm_timeout_seconds: float = 30
     # 每次提问检索多少段最相关的文字交给 LLM

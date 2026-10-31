@@ -1,12 +1,18 @@
-# 测试混合检索：中文分词、关键词检索（权限隔离、IDF）、RRF 融合
+# 测试检索的改进：中文分词、关键词检索（权限隔离、IDF）、RRF 融合、重排序接口
 
+# httpx2：模拟重排序接口的 HTTP 响应
+import httpx2
+# pytest：测试框架
+import pytest
 # select：直接查数据库做验证
 from sqlalchemy import select
 # Vector：save_chunks 需要的向量类型
 from pgvector import Vector
 
 # 被测试的模块
-from app import queries
+from app import llm, queries
+# 临时改配置（API key）
+from app.config import settings
 from app.models import Chunk, Document, DocumentStatus
 from app.processing import save_chunks
 from app.queries import RetrievedChunk
@@ -124,3 +130,36 @@ def test_hybrid_search_includes_keyword_hits(db, make_user):
     # 返回的 score 仍然是余弦相似度（0-1），不是 RRF 得分
     assert all(0 <= c.score <= 1 for c in results)
 
+
+
+# ============================ 重排序 ============================
+
+
+# 假的 HTTP 响应：只实现 rerank 用到的两个方法
+class FakeResponse:
+    def __init__(self, status_code: int, body: dict):
+        self.status_code = status_code
+        self.body = body
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx2.HTTPStatusError("error", request=httpx2.Request("POST", "http://x"), response=None)
+
+    def json(self):
+        return self.body
+
+
+# 测试：接口按分数从高到低返回结果，rerank 要按 index 放回输入的顺序
+def test_rerank_returns_scores_in_input_order(monkeypatch):
+    monkeypatch.setattr(settings, "dashscope_api_key", "test-key")
+    body = {"output": {"results": [{"index": 1, "relevance_score": 0.9}, {"index": 0, "relevance_score": 0.2}]}}
+    monkeypatch.setattr(httpx2, "post", lambda *args, **kwargs: FakeResponse(200, body))
+    assert llm.rerank("q", ["无关", "相关"]) == [0.2, 0.9]
+
+
+# 测试：接口出错（这里模拟欠费返回 400）时，统一抛出 LLMUnavailable
+def test_rerank_failure_raises_llm_unavailable(monkeypatch):
+    monkeypatch.setattr(settings, "dashscope_api_key", "test-key")
+    monkeypatch.setattr(httpx2, "post", lambda *args, **kwargs: FakeResponse(400, {"code": "Arrearage"}))
+    with pytest.raises(llm.LLMUnavailable):
+        llm.rerank("q", ["a"])

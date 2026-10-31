@@ -12,6 +12,8 @@
 # dataclass：自动生成 __init__ 的装饰器，用来定义只装数据的小类
 from dataclasses import dataclass
 
+# httpx2：发 HTTP 请求的库（openai 库底层用的就是它）。重排序接口不兼容 OpenAI，直接用它调用
+import httpx2
 # OpenAI：客户端类；OpenAIError：openai 库所有错误的基类
 from openai import OpenAI, OpenAIError
 # Vector：pgvector 库的向量类型，内部用紧凑的 4 字节浮点数存储，可以直接写进数据库
@@ -109,3 +111,34 @@ def chat(messages: list[dict], tools: list[dict] | None = None, allow_tools: boo
     tokens = response.usage.total_tokens if response.usage else 0
     # content 可能是 None（只调用工具时），用 or "" 兜底
     return ChatReply(message.content or "", calls, tokens)
+
+
+# 重排序：给每段文字和问题的相关程度打分（0-1），返回的分数和输入的顺序一一对应。
+# 和向量检索的区别：向量检索是问题和段落各自转成向量再比较，没有"一起读"过；
+# 重排序模型把问题和段落放在一起读，判断得更准，但每次都要调用模型，又慢又花钱，
+# 所以只用来给向量检索选出的少量候选重新排序
+def rerank(query: str, documents: list[str]) -> list[float]:
+    if not documents:
+        return []
+    if not settings.dashscope_api_key:
+        raise LLMUnavailable("DASHSCOPE_API_KEY is not set in .env")
+    try:
+        response = httpx2.post(
+            settings.rerank_url,
+            headers={"Authorization": f"Bearer {settings.dashscope_api_key}"},
+            # top_n：返回几段的分数。这里要全部
+            json={"model": settings.rerank_model, "input": {"query": query, "documents": documents}, "parameters": {"top_n": len(documents)}},
+            timeout=settings.llm_timeout_seconds,
+        )
+        # 4xx、5xx 状态码抛出 HTTPStatusError
+        response.raise_for_status()
+        # 返回的结果按分数从高到低排，每项带着它在输入里的位置 index
+        results = response.json()["output"]["results"]
+    # HTTPError：网络错误、超时、错误状态码；KeyError、ValueError：返回的内容格式不对
+    except (httpx2.HTTPError, KeyError, ValueError) as e:
+        raise LLMUnavailable(f"rerank failed: {e}") from e
+    # 按 index 放回输入的顺序
+    scores = [0.0] * len(documents)
+    for item in results:
+        scores[item["index"]] = item["relevance_score"]
+    return scores
