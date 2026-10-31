@@ -26,7 +26,8 @@ from sqlalchemy import (
 # Vector：pgvector 扩展提供的向量列类型，用来存 embedding（一串浮点数）
 from pgvector.sqlalchemy import Vector
 # JSONB：PostgreSQL 特有的 JSON 类型（二进制存储，可以建索引、可以查询内部字段）
-from sqlalchemy.dialects.postgresql import JSONB
+# TSVECTOR：PostgreSQL 全文检索用的类型，存"这段文字里有哪些词、各在第几个位置"
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 # DeclarativeBase：所有模型类的基类
 # Mapped：类型标注，表示"这个属性映射到数据库的一列"
 # mapped_column：定义一列的具体细节（类型、约束、默认值等）
@@ -202,6 +203,9 @@ class Chunk(Base):
             postgresql_using="hnsw",
             postgresql_ops={"embedding": "vector_cosine_ops"},
         ),
+        # GIN 倒排索引：加速关键词检索。记录"每个词出现在哪些段落里"，
+        # 查一个词时直接拿到包含它的段落，不用逐段扫描。和书末尾的"索引页"一个道理
+        Index("ix_chunks_terms_gin", "terms", postgresql_using="gin"),
     )
 
     # 主键
@@ -219,6 +223,9 @@ class Chunk(Base):
     # 允许为空的原因：给一张已经有数据的表加新列时，旧的行没有值。
     # 正常流程里，worker 写入段落时一定会同时写入向量
     embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIM))
+    # 这一段分词后的结果（见 app/segment.py），给关键词检索用。
+    # 允许为空的原因和 embedding 一样：加这一列之前就存在的段落，由迁移补上
+    terms: Mapped[str | None] = mapped_column(TSVECTOR)
 
     # 关系：chunk.document 拿到所属文档
     document: Mapped[Document] = relationship(back_populates="chunks")

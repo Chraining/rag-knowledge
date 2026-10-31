@@ -4,6 +4,7 @@
     uv run python -m scripts.evaluate                             # 自建评测集，线上的切分参数（段长 500、重叠 50）
     uv run python -m scripts.evaluate --chunk-size 300            # 换一个段长，和上面的结果对比
     uv run python -m scripts.evaluate --dataset duretrieval       # 公开数据集 DuRetrieval 的子集
+    uv run python -m scripts.evaluate --mode vector               # 只用向量检索，和默认的混合检索对比
 
 评测检索效果。用法见上面的命令。
 
@@ -251,12 +252,22 @@ def relevant_items(q: Question, chunk: RetrievedChunk) -> set[str]:
     return {chunk.filename} & set(q.relevant)
 
 
-# 对每个问题执行一次线上的检索，算出它的排名和各个 Recall@k
-def evaluate(db: Session, user_id: int, questions: list[Question]) -> list[Result]:
+# 用哪种方式检索，前 DEPTH 段。hybrid 就是线上用的方式；vector、keyword 是它的两路，单独测，看各自的贡献
+def search(db: Session, user_id: int, mode: str, question: str) -> list[queries.RetrievedChunk]:
+    # 问题转向量（带缓存），和线上一样
+    vector = rag.embed_query(question)
+    if mode == "vector":
+        return queries.search_chunks(db, user_id, vector, DEPTH)
+    if mode == "keyword":
+        return queries.keyword_search_chunks(db, user_id, question, vector, DEPTH)
+    return queries.hybrid_search_chunks(db, user_id, question, vector, DEPTH)
+
+
+# 对每个问题执行一次检索，算出它的排名和各个 Recall@k
+def evaluate(db: Session, user_id: int, questions: list[Question], mode: str) -> list[Result]:
     results = []
     for q in questions:
-        # 和线上完全相同的两步：问题转向量（带缓存）→ 向量检索（按用户过滤、HNSW 索引）
-        chunks = queries.search_chunks(db, user_id, rag.embed_query(q.question), DEPTH)
+        chunks = search(db, user_id, mode, q.question)
         # 一共有几个相关内容：自建评测集是 1 个答案，公开数据集是相关段落的个数
         total = 1 if q.answer else len(q.relevant)
         rank, score, found, recall = None, None, set(), {}
@@ -314,6 +325,9 @@ def main() -> None:
     parser.add_argument("--dataset", choices=["self", "duretrieval"], default="self", help="用哪份评测集")
     parser.add_argument("--chunk-size", type=int, default=CHUNK_SIZE, help="每段最多多少个字符")
     parser.add_argument("--overlap", type=int, default=CHUNK_OVERLAP, help="相邻两段重叠多少个字符")
+    parser.add_argument(
+        "--mode", choices=["hybrid", "vector", "keyword"], default="hybrid", help="检索方式，默认是线上用的混合检索"
+    )
     parser.add_argument("--check-only", action="store_true", help="只检查标注和切分，不连数据库、不调用 embedding")
     args = parser.parse_args()
 
@@ -333,8 +347,8 @@ def main() -> None:
     engine = prepare_database()
     with Session(engine) as db:
         user_id = build_index(db, corpus, args.chunk_size, args.overlap)
-        print()
-        report(evaluate(db, user_id, questions))
+        print(f"\n检索方式：{args.mode}")
+        report(evaluate(db, user_id, questions, args.mode))
     engine.dispose()
 
 

@@ -77,6 +77,27 @@ Python 3.13 · FastAPI · SQLAlchemy 2.0 · Alembic · PostgreSQL 18 + pgvector�
 - **长文档导致 worker 被杀并循环重试**：500 万字的文档让 worker 超过 400MB 内存上限被系统杀掉；Celery 的 `acks_late` 又把任务重新投递，形成死循环。通过 cgroup `memory.peak` 和内存采样定位到向量用 Python 列表存储（每个约 36KB）、一次性写库。改用 pgvector 的紧凑 `Vector` 类型（约 4KB）并每 200 段分批写入后，峰值内存从被杀降到 **181MB**。测量脚本：[`scripts/measure_memory.py`](scripts/measure_memory.py)。
 - **重建应用容器后 502**：Nginx 只在启动时解析一次 `app` 的 IP，容器重建换了 IP 后还在访问旧地址。改为通过 Docker 内置 DNS（`127.0.0.11`）动态解析。见 [`docker/nginx.conf`](docker/nginx.conf)。
 
+## 检索评测
+
+用两份评测集衡量检索效果，脚本 [`scripts/evaluate.py`](scripts/evaluate.py)：
+
+- **自建评测集**：10 份虚构公司的文档（制度、说明书、故障代码表、会议纪要、价格表），52 个问题，分为关键词类（型号、代码）和语义类（换了说法的问题），见 [`eval/`](eval/)。
+- **DuRetrieval 子集**：百度发布的公开中文检索数据集（C-MTEB），抽取 300 个真实搜索查询和 1 万段网页段落，见 [`scripts/build_duretrieval.py`](scripts/build_duretrieval.py)。
+
+指标：Recall@5（相关段落有多少进了前 5，线上只把前 5 段交给模型）、MRR（第一个相关段落排名的倒数的平均值）。
+
+**混合检索（向量 + 关键词）做了，但实测没有提升，所以线上仍只用向量检索：**
+
+| 检索方式 | DuRetrieval Recall@5 | DuRetrieval MRR | 自建 Recall@5 | 自建 MRR |
+|---|---|---|---|---|
+| 向量（线上使用） | **80.5%** | **0.977** | **100%** | **0.842** |
+| 关键词（jieba + 带 IDF 的 BM25 式打分） | 60.8% | 0.861 | 90.4% | 0.745 |
+| 混合（RRF 融合） | 75.9% | 0.944 | 94.2% | 0.828 |
+
+- 关键词检索：jieba 分词后存进 PostgreSQL 的 `tsvector` 列（GIN 索引）。PostgreSQL 自带的 `ts_rank` 只看词频、没有 IDF，常见词会淹没型号这类关键词；离线实测只用 `ts_rank` 的 Recall@5 只有 26.7%，补上 IDF 后为 60.8%，和标准 BM25（60.5%）相当。见 [`app/queries.py`](app/queries.py)。
+- 混合检索更差的原因：text-embedding-v4 已经很强，关键词这一路明显更弱，RRF 融合时把好的向量结果挤出了前 5；给关键词降低权重（0.25–0.75）也都不如纯向量。关键词检索也几乎找不到新的相关段落：向量前 20 名已覆盖 97.1%，加上关键词结果（共约 33 段）为 97.8%，和直接取向量前 40 名相同。
+- 结论：瓶颈不在召回（前 20 名已有 97%），而在排序（前 5 名只有 80.5%），下一步是重排序（reranker）。
+
 ## 本地运行
 
 需要 Docker 和 [uv](https://docs.astral.sh/uv/)，以及 DeepSeek 和阿里云百炼的 API key。
@@ -110,7 +131,7 @@ docker compose up -d postgres
 uv run pytest
 ```
 
-共 129 个测试，覆盖权限隔离、Agent 工具与循环上限、任务幂等、配额与降级、文件格式与安全校验等。测试使用真实的 PostgreSQL（独立的 `rag_test` 库，每个测试在事务里运行后回滚），AI 服务和 Redis 换成假的，不联网、不花钱。每次推送由 GitHub Actions 自动运行。
+共 137 个测试，覆盖权限隔离、Agent 工具与循环上限、任务幂等、配额与降级、文件格式与安全校验等。测试使用真实的 PostgreSQL（独立的 `rag_test` 库，每个测试在事务里运行后回滚），AI 服务和 Redis 换成假的，不联网、不花钱。每次推送由 GitHub Actions 自动运行。
 
 ## 项目结构
 
@@ -118,23 +139,25 @@ uv run pytest
 app/
   agent.py          Agent：工具定义、工具调用循环、引用编号
   routers/          接口：认证、文档、问答、会话、健康检查
-  queries.py        所有查询（按用户过滤）和向量检索
+  queries.py        所有查询（按用户过滤）、向量检索、关键词检索和混合检索
   processing.py     文档处理：提取 → 切分 → 向量化 → 入库（幂等）
   extract.py        各格式的文字提取与安全校验
   tasks.py          Celery 任务：重试策略
   llm.py            调用 DeepSeek 和百炼（超时、重试、统一错误）
   rag.py            问题向量（Redis 缓存）
+  segment.py        中文分词（jieba），给关键词检索用
   quota.py          每日配额
   models.py         数据表
 alembic/            数据库迁移
 frontend/           单页面前端
 docker/             Nginx 配置、数据库初始化脚本
-scripts/            造数据、EXPLAIN 分析、内存测量等脚本
+scripts/            检索评测、造数据、EXPLAIN 分析、内存测量等脚本
+eval/               自建检索评测集
 tests/              pytest 测试
 ```
 
 ## 局限
 
 - 扫描版 PDF 和图片需要 OCR，目前不支持。
-- 只按字数切分，没有按章节结构切分；只用向量检索，没有关键词检索和重排序（reranker）。
+- 只按字数切分，没有按章节结构切分；没有重排序（reranker）。
 - 每个问题至少调用一次大模型，一般 2–3 次，比固定的"检索一次再回答"更慢、更贵。

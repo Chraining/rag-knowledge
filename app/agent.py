@@ -173,7 +173,8 @@ class Agent:
 
     # 工具 search_documents：语义检索
     def search(self, query: str, document_id: int | None) -> str:
-        # 问题 → 向量（带缓存）→ 检索。embedding 服务挂了会抛 LLMUnavailable，由接口返回 503
+        # 问题 → 向量（带缓存）→ 检索。embedding 服务挂了会抛 LLMUnavailable，由接口返回 503。
+        # 只用向量检索、没用混合检索（queries.hybrid_search_chunks）：两份评测集上实测混合检索都更差，见 README
         chunks = queries.search_chunks(
             self.db, self.user_id, rag.embed_query(query), settings.retrieval_top_k, document_id
         )

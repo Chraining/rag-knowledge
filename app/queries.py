@@ -9,6 +9,8 @@ in SQL. Never load a row by id and check ownership afterwards in Python.
 那种写法在复杂查询里迟早会漏掉一处，造成越权（用户 A 看到用户 B 的数据）。
 """
 
+# math.log：计算 IDF（见 keyword_search_chunks）
+import math
 # dataclass：一个装饰器，能自动给类生成 __init__ 等方法，适合定义"只装数据的小类"
 from dataclasses import dataclass
 # datetime：用于类型标注
@@ -33,6 +35,8 @@ from app.models import (
     UsageLog,
     User,
 )
+# 中文分词，关键词检索用
+from app.segment import segment
 
 
 # ============================ 用户 ============================
@@ -245,6 +249,108 @@ def search_chunks(
         RetrievedChunk(chunk_id, document_id, filename, content, 1 - dist)
         for chunk_id, document_id, filename, content, dist in db.execute(stmt)
     ]
+
+
+# 关键词检索：找出包含问题里的词的段落，按 BM25 的思路打分。
+# 和向量检索互补：向量擅长"意思相近、用词不同"，但对型号、缩写、专有名词（"E171"、"8218"）这种
+# 没什么"意思"可言的词很弱，这些词只能按字面匹配。
+#
+# 打分：每个词的得分 = IDF × 这个词在段落里的词频得分，所有词加起来。
+#   IDF（逆文档频率）：越少的段落包含这个词，这个词越重要。"老板8218怎么样"里，"怎么样"到处都有，
+#     几乎没有区分度；"8218"只出现在极少数段落里，命中它才说明找对了。
+#   词频得分：用 PostgreSQL 自带的 ts_rank 对单个词打分。出现次数越多分越高，但增长越来越慢
+#     （出现 10 次不会是 1 次的 10 倍）；参数 1 表示再除以段落长度的对数，长段落不会因为字多而占便宜。
+# 为什么不直接用 ts_rank 给整个问题打分：它只看词出现了几次，没有 IDF，常见词会把关键的词淹没。
+# 在 DuRetrieval 上离线实测：只数次数 Recall@5 约 27%，加上 IDF 约 61%，和标准 BM25 公式（60.5%）基本一样。
+#
+# 也传入问题向量：返回的每段都带上余弦相似度，和向量检索的结果统一，调用方才能用同一条最低分数线过滤
+def keyword_search_chunks(
+    db: Session, user_id: int, query: str, query_vector: list[float], top_k: int, document_id: int | None = None
+) -> list[RetrievedChunk]:
+    # dict.fromkeys：去掉重复的词，保留顺序（同一个词出现两次不重复计分）
+    words = list(dict.fromkeys(segment(query)))
+    # 问题里没有一个词（比如只有标点）：没法做关键词检索
+    if not words:
+        return []
+    # 每个词一个检索条件。词都是 \w 组成的（见 segment），不会含有 & | ! 这类在检索语法里有特殊含义的符号
+    word_queries = [func.to_tsquery("simple", word) for word in words]
+    # 检索的范围：这个用户已处理完成的文档（传了 document_id 就只是这一个文档）。
+    # 下面统计 IDF 和真正检索都在这个范围里，所以单独写成一个函数
+    def in_scope(stmt):
+        stmt = stmt.join(Document, Chunk.document_id == Document.id).where(
+            Document.user_id == user_id,  # 权限过滤：只搜自己的文档
+            Document.status == DocumentStatus.READY,  # 只搜处理完成的文档
+            Chunk.embedding.is_not(None),  # 和向量检索一样跳过没有向量的段落（要计算相似度）
+        )
+        return stmt if document_id is None else stmt.where(Chunk.document_id == document_id)
+
+    # 第一条 SQL：一共多少段，以及每个词出现在多少段里（文档频率 df）。
+    # count().filter(条件)：只数满足条件的行，一次扫描就能把每个词的 df 都数出来。
+    # @@：全文检索的"匹配"运算符，terms 里包含这个词才算匹配
+    total, *dfs = db.execute(
+        in_scope(select(func.count(), *[func.count().filter(Chunk.terms.op("@@")(q)) for q in word_queries]).select_from(Chunk))
+    ).one()
+    # IDF，和 BM25 用的公式一样：包含这个词的段落越少，值越大；几乎每段都有的词接近 0
+    idfs = [math.log(1 + (total - df + 0.5) / (df + 0.5)) for df in dfs]
+    # 每段的得分：所有词的 IDF × 词频得分 之和
+    score = sum(idf * func.ts_rank(Chunk.terms, q, 1) for idf, q in zip(idfs, word_queries, strict=True))
+    # 检索条件：包含任意一个词就算匹配（| 表示"或"），例如 "路由 | 路由器 | 报 | e171"。
+    # 用"或"而不是"且"：问题里的"怎么"、"什么"这类词段落里通常没有，要求全部包含的话几乎什么都搜不到。
+    # 这一步会用上 GIN 索引
+    any_word = func.to_tsquery("simple", " | ".join(words))
+    distance = Chunk.embedding.cosine_distance(query_vector)
+    stmt = (
+        in_scope(select(Chunk.id, Chunk.document_id, Document.filename, Chunk.content, distance).select_from(Chunk))
+        .where(Chunk.terms.op("@@")(any_word))
+        # 得分从高到低
+        .order_by(score.desc())
+        .limit(top_k)
+    )
+    return [
+        RetrievedChunk(chunk_id, document_id, filename, content, 1 - dist)
+        for chunk_id, document_id, filename, content, dist in db.execute(stmt)
+    ]
+
+
+# RRF（Reciprocal Rank Fusion，倒数排名融合）：把几个排好序的列表合并成一个。
+# 每段的得分 = 它在每个列表里的 1 / (RRF_K + 名次) 之和，名次从 1 开始。
+# 只看名次，不看原来的分数：向量的相似度（0-1）和关键词的 ts_rank 量纲完全不同，没法直接相加，名次可以。
+# 两个列表都排得靠前的段落得分最高；只出现在一个列表里的，也能凭名次排进来
+RRF_K = 60
+
+
+def fuse(result_lists: list[list[RetrievedChunk]], top_k: int) -> list[RetrievedChunk]:
+    # {段落 id: 累计得分}
+    scores: dict[int, float] = {}
+    # {段落 id: 段落}，同一段在两个列表里都出现时，内容一样，留哪个都行
+    chunks: dict[int, RetrievedChunk] = {}
+    for results in result_lists:
+        for rank, chunk in enumerate(results, start=1):
+            scores[chunk.chunk_id] = scores.get(chunk.chunk_id, 0) + 1 / (RRF_K + rank)
+            chunks[chunk.chunk_id] = chunk
+    # 按得分从高到低排，取前 top_k 段
+    best = sorted(scores, key=scores.__getitem__, reverse=True)[:top_k]
+    return [chunks[chunk_id] for chunk_id in best]
+
+
+# 混合检索每一路取多少段候选。比最终要的多取一些：某段在一路里排第 8，在另一路里排第 2，
+# 融合后可能排进前 5，只各取 5 段的话它在第一路里就被截掉了
+HYBRID_CANDIDATES = 20
+
+
+# 混合检索：向量检索和关键词检索各取一批候选，用 RRF 合并，返回前 top_k 段。
+# 返回的 score 仍然是余弦相似度（不是 RRF 得分），所以调用方原来的最低分数线照样可以用
+def hybrid_search_chunks(
+    db: Session, user_id: int, query: str, query_vector: list[float], top_k: int, document_id: int | None = None
+) -> list[RetrievedChunk]:
+    candidates = max(top_k, HYBRID_CANDIDATES)
+    return fuse(
+        [
+            search_chunks(db, user_id, query_vector, candidates, document_id),
+            keyword_search_chunks(db, user_id, query, query_vector, candidates, document_id),
+        ],
+        top_k,
+    )
 
 
 # 按顺序读取某个文档的前 limit 段（"通读"一个文档，不是检索）

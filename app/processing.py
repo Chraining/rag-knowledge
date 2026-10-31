@@ -27,7 +27,8 @@ from pathlib import PurePath
 # Vector：向量类型（见 llm.embed_texts）
 from pgvector import Vector
 # delete、insert、select、update：构造对应的 SQL 语句
-from sqlalchemy import delete, insert, select, update
+# bindparam：SQL 里的一个"参数占位符"；func：调用数据库函数（这里用 to_tsvector）
+from sqlalchemy import bindparam, delete, func, insert, select, update
 # Session：数据库会话的类型
 from sqlalchemy.orm import Session
 
@@ -37,6 +38,8 @@ from app import llm
 from app.extract import TABLE_EXTENSIONS, PermanentError, extract_text
 # 模型
 from app.models import Chunk, Document, DocumentStatus
+# 中文分词，给关键词检索用
+from app.segment import segment
 # 读取磁盘上的文件
 from app.storage import read_file
 
@@ -153,16 +156,21 @@ def save_chunks(db: Session, document_id: int, chunks: list[str], vectors: list[
     db.execute(delete(Chunk).where(Chunk.document_id == document_id))
     # 每段文字和它的向量配成一行。zip 把两者配对；enumerate 再加上序号 i（从 0 开始）。
     # 这里用的是生成器（圆括号），不会一次性把所有行都造出来
+    # words：分词后用空格连起来的词，例如 "路由 路由器 报 e171"，下面的 insert 语句把它转成 terms 列
     rows = (
-        {"document_id": document_id, "chunk_index": i, "content": text, "embedding": vector}
+        {"document_id": document_id, "chunk_index": i, "content": text, "embedding": vector, "words": " ".join(segment(text))}
         for i, (text, vector) in enumerate(zip(chunks, vectors, strict=True))
     )
+    # terms 列 = to_tsvector('simple', words)：在数据库里把词表转成全文检索类型（tsvector）。
+    # 'simple'：只按空格切开、转小写，不做别的处理。PostgreSQL 自带的配置都是给英文等语言用的
+    # （比如把 running 还原成 run），中文已经由 jieba 切好了，只需要 simple
+    stmt = insert(Chunk).values(terms=func.to_tsvector("simple", bindparam("words")))
     # 每次插入 200 行，而不是一次插入全部。
     # 原因：写入时每个向量都要先转成约 19KB 的文本，一本长小说有上万段，一次性全部转换要几百 MB 内存，
     # 实测 500 万字的文档会让 worker 超过 400MB 的内存上限被系统杀掉。分批之后内存峰值和文档长度基本无关。
     # 所有批次仍然在同一个事务里，最后一起 commit，"要么全写进去，要么都不生效"的保证不变
     for batch in batched(rows, SAVE_BATCH_SIZE):
-        db.execute(insert(Chunk), list(batch))
+        db.execute(stmt, list(batch))
     # 更新文档的状态和统计信息
     doc.status = DocumentStatus.READY
     doc.chunk_count = len(chunks)

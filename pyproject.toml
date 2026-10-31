@@ -7,6 +7,7 @@ dependencies = [
     "celery[redis]>=5.6.3",
     "email-validator>=2.3.0",
     "fastapi>=0.143.0",
+    "jieba>=0.42.1",
     "openai>=3.31.0",
     "openpyxl>=3.1.5",
     "pgvector>=0.5.1",
