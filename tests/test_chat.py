@@ -1,12 +1,19 @@
 # 测试问答链路：检索、权限隔离、会话与多轮对话、配额、缓存、外部服务失败时的降级
 
+# json：构造工具参数
+import json
+# Decimal：费用是精确的十进制小数
+from decimal import Decimal
+
+# pytest：approx 比较浮点数
+import pytest
 # select、func：直接查数据库做验证
 from sqlalchemy import func, select
 
 # 被测试的模块
-from app import processing, queries, rag
+from app import llm, processing, queries, rag
 # 模型
-from app.models import Conversation, Message, UsageAction, UsageLog, User
+from app.models import Conversation, Message, MessageRole, UsageAction, UsageLog, User
 # 假 embedding：测试里直接算问题的向量
 from tests.conftest import fake_embedding
 
@@ -118,6 +125,27 @@ def test_follow_up_sends_history(client, db, register_and_login, enqueued, fake_
     assert len(client.get(f"/conversations/{conversation_id}/messages", headers=headers).json()) == 4
 
 
+# 测试：每次问答返回所有轮次加起来的 token 数和费用，并记录在回答消息和使用记录里
+def test_answer_reports_and_records_usage(client, db, register_and_login, enqueued, fake_llm):
+    headers = register_and_login("alice")
+    add_ready_doc(client, db, headers, enqueued, "tea.md", "green tea comes from china")
+    # 两轮：先检索，再回答。参数依次是：内容、工具调用、总 token 数、输入 token 数、费用
+    search = llm.ToolCall("call-1", "search_documents", json.dumps({"query": "green tea"}))
+    fake_llm.script = [
+        llm.ChatReply("", [search], 100, 90, Decimal("0.001")),
+        llm.ChatReply("green tea [1]", [], 50, 30, Decimal("0.002")),
+    ]
+    body = ask(client, headers, "where does green tea come from?").json()
+    assert body["tokens"] == 150
+    assert body["cost"] == pytest.approx(0.003)
+    answer = db.scalar(select(Message).where(Message.role == MessageRole.ASSISTANT))
+    assert (answer.tokens_used, answer.cost) == (150, Decimal("0.003"))
+    assert db.scalar(select(UsageLog.cost).where(UsageLog.action == UsageAction.QUERY)) == Decimal("0.003")
+    # 历史消息里也能看到：用户的提问没有费用，回答有
+    messages = client.get(f"/conversations/{body['conversation_id']}/messages", headers=headers).json()
+    assert [(m["tokens_used"], m["cost"]) for m in messages] == [(0, None), (150, pytest.approx(0.003))]
+
+
 # 测试：不能往别人的会话里提问，也不能看、不能删别人的会话
 def test_cannot_use_other_users_conversation(client, db, register_and_login, enqueued):
     alice, bob = register_and_login("alice"), register_and_login("bob")
@@ -144,7 +172,14 @@ def test_irrelevant_chunks_are_dropped(client, db, register_and_login, enqueued,
 def test_no_documents_gives_no_sources(client, register_and_login, fake_llm):
     headers = register_and_login("alice")
     r = ask(client, headers, "anything?")
-    assert r.json() == {"conversation_id": r.json()["conversation_id"], "answer": "fake answer", "sources": []}
+    assert r.json() == {
+        "conversation_id": r.json()["conversation_id"],
+        "answer": "fake answer",
+        "sources": [],
+        # 假的模型：检索一轮 10 个 token、回答一轮 42 个 token，没有设置费用
+        "tokens": 52,
+        "cost": 0.0,
+    }
 
 
 # 测试：会话列表按最近活跃排序；往旧会话里追问后，它会排到最前面（updated_at 被更新）

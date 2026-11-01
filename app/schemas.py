@@ -111,6 +111,8 @@ class ChatResponse(BaseModel):
     conversation_id: int  # 会话 id，追问时传回来
     answer: str  # 回答
     sources: list[SourceOut]  # 引用来源
+    tokens: int  # 这次问答消耗的 token 数（所有轮次的输入 + 输出）
+    cost: float  # 这次问答的大模型费用（元）
 
 
 # 一条消息
@@ -122,6 +124,9 @@ class MessageOut(BaseModel):
     content: str
     # 引用来源（只有 assistant 消息有）。格式：[{"chunk_id": 1, "document_id": 2, "score": 0.83}, ...]
     sources: list[dict] | None
+    tokens_used: int  # 这次问答消耗的 token 数（只有 assistant 消息有，用户消息是 0）
+    # 这次问答的费用（元）。为空：用户消息，或者记录费用之前的回答
+    cost: float | None
     created_at: datetime
 
 

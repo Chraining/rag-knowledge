@@ -98,10 +98,11 @@ def chat(body: ChatRequest, user: CurrentUser, db: DbSession) -> ChatResponse:
             content=result.answer,
             sources=sources,
             tokens_used=result.tokens,
+            cost=result.cost,
         )
     )
     # 使用记录：Redis 不可用时，配额就靠数这张表；同时也是统计用量和费用的依据
-    db.add(UsageLog(user_id=user.id, action=UsageAction.QUERY, tokens_used=result.tokens))
+    db.add(UsageLog(user_id=user.id, action=UsageAction.QUERY, tokens_used=result.tokens, cost=result.cost))
     # 四种写入在同一个事务里，要么全部成功，要么全部不生效
     db.commit()
 
@@ -118,6 +119,8 @@ def chat(body: ChatRequest, user: CurrentUser, db: DbSession) -> ChatResponse:
             )
             for c in result.sources
         ],
+        tokens=result.tokens,
+        cost=result.cost,
     )
 
 

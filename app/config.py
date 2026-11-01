@@ -1,6 +1,9 @@
 # 配置模块：集中管理所有"可能因环境而变"的值（数据库地址、配额等）。
 # 好处：开发、测试、生产只需改 .env 文件，不用改代码。
 
+# Decimal：精确的十进制小数，价格用它（浮点数算钱会有误差）
+from decimal import Decimal
+
 # pydantic_settings 是一个库，能自动从环境变量和 .env 文件里读取配置
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -59,6 +62,12 @@ class Settings(BaseSettings):
     chat_base_url: str = "https://api.deepseek.com"
     # deepseek-chat：DeepSeek 的普通对话模型（不带"深度思考"，回答快、便宜）
     chat_model: str = "deepseek-chat"
+    # 大模型的价格（元 / 百万 token），用来算每次问答的费用（见 llm.chat_cost）。
+    # 这是 deepseek-flash 的高峰价：deepseek-chat 是已经下线的旧名字，接口现在把它转给 deepseek-flash。
+    # 来自 https://api-docs.deepseek.com/zh-cn/quick_start/pricing ，价格会调整，以官网为准
+    chat_price_cache_hit: Decimal = Decimal("0.04")  # 输入，命中缓存（和之前请求相同的开头部分）
+    chat_price_cache_miss: Decimal = Decimal("2")  # 输入，没有命中缓存
+    chat_price_output: Decimal = Decimal("8")  # 输出
 
     # 文字转向量：阿里云百炼 DashScope（DeepSeek 没有 embedding 接口）。
     # key 在百炼控制台创建，写进 .env 的 DASHSCOPE_API_KEY

@@ -8,6 +8,8 @@
 import enum
 # datetime：日期时间类型，这里只用来做类型标注
 from datetime import datetime
+# Decimal：精确的十进制小数，费用列的类型标注
+from decimal import Decimal
 
 # 从 SQLAlchemy 导入各种"列类型"和"约束"
 from sqlalchemy import (
@@ -18,6 +20,7 @@ from sqlalchemy import (
     ForeignKey,  # 外键：表示"这一列引用另一张表的主键"
     Index,  # 索引：加快查询的数据结构，类似书的目录
     Integer,  # 普通整数（4 字节）
+    Numeric,  # 精确的十进制小数，存金额用
     String,  # 有长度上限的字符串，对应 SQL 的 VARCHAR(n)
     Text,  # 不限长度的长文本
     UniqueConstraint,  # 唯一约束：某一列（或几列组合）的值不能重复
@@ -285,6 +288,11 @@ class Message(Base):
     sources: Mapped[list | None] = mapped_column(JSONB)
     # 这条消息消耗了多少 token（LLM 按 token 计费）
     tokens_used: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # 这次问答的费用（元），只有回答有，按 token 数和价格算出来（见 llm.chat_cost）。
+    # 用 Numeric（精确的十进制小数）而不是浮点数：浮点数算钱会有误差，例如 0.1 + 0.2 = 0.30000000000000004。
+    # 8 位小数：一次提问约 0.004 元，而命中缓存的 1 个 token 只要 0.00000004 元。
+    # 为空：用户的提问，或者加上这一列之前的回答（当时没有记录费用，不能当成 0）
+    cost: Mapped[Decimal | None] = mapped_column(Numeric(12, 8))
     # clock_timestamp(), not now(): now() is fixed per transaction, so a question and
     # its answer saved together would tie and their order would be undefined.
     # 这里用 clock_timestamp() 而不是 now()：
@@ -319,5 +327,7 @@ class UsageLog(Base):
     action: Mapped[UsageAction] = mapped_column(_str_enum(UsageAction, "usage_action"))
     # 这次操作用了多少 token
     tokens_used: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # 这次操作的大模型费用（元），和 messages.cost 一样。为空：上传，或者加上这一列之前的提问
+    cost: Mapped[Decimal | None] = mapped_column(Numeric(12, 8))
     # 操作时间
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

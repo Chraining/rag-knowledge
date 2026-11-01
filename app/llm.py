@@ -11,6 +11,10 @@
 
 # dataclass：自动生成 __init__ 的装饰器，用来定义只装数据的小类
 from dataclasses import dataclass
+# datetime：判断调用时是不是高峰时段
+from datetime import datetime
+# Decimal：费用用精确的十进制小数
+from decimal import Decimal
 
 # httpx2：发 HTTP 请求的库（openai 库底层用的就是它）。重排序接口不兼容 OpenAI，直接用它调用
 import httpx2
@@ -23,6 +27,8 @@ from pgvector import Vector
 from app.config import settings
 # 向量维度
 from app.models import EMBEDDING_DIM
+# 北京时间（判断高峰时段用）
+from app.quota import BEIJING
 
 # DashScope 的 embedding 接口一次最多接收 10 段文字，多了要分批发送
 EMBED_BATCH_SIZE = 10
@@ -87,6 +93,30 @@ class ChatReply:
     content: str  # 回答内容；调用工具时通常为空
     tool_calls: list[ToolCall]  # 要调用的工具，可以一次调用多个
     tokens: int  # 这次调用消耗的 token 数（输入 + 输出），用于统计用量和费用
+    # 其中输入（提示词）的 token 数。多轮工具调用时，前面每一轮的内容都会重新发送一遍，输入占了大头，
+    # 测量上下文用了多少就看它（见 scripts/measure_context.py）。有默认值，测试里构造回复时可以不写
+    prompt_tokens: int = 0
+    # 这次调用的费用（元），见 chat_cost
+    cost: Decimal = Decimal(0)
+
+
+# 是不是 DeepSeek 的高峰时段：北京时间工作日 9:00-12:00、14:00-18:00，其他时间半价。
+# 没有考虑法定节假日（官方规定节假日不算高峰），所以节假日的费用会多算一倍
+def is_peak(at: datetime) -> bool:
+    local = at.astimezone(BEIJING)
+    # weekday()：周一是 0，周日是 6
+    return local.weekday() < 5 and (9 <= local.hour < 12 or 14 <= local.hour < 18)
+
+
+# 一次调用的费用（元）。DeepSeek 只返回 token 数，不返回费用，所以按价格自己算。
+# 输入分两种价格：命中缓存的（cache_hit）和没命中的（cache_miss），两者加起来就是输入的 token 数
+def chat_cost(cache_hit: int, cache_miss: int, output: int, at: datetime) -> Decimal:
+    cost = (
+        cache_hit * settings.chat_price_cache_hit
+        + cache_miss * settings.chat_price_cache_miss
+        + output * settings.chat_price_output
+    ) / 1_000_000
+    return cost if is_peak(at) else cost / 2
 
 
 # 让大模型根据对话消息生成回复。
@@ -109,8 +139,14 @@ def chat(messages: list[dict], tools: list[dict] | None = None, allow_tools: boo
     calls = [ToolCall(c.id, c.function.name, c.function.arguments) for c in message.tool_calls or []]
     # usage 里记录了这次调用消耗的 token 数
     tokens = response.usage.total_tokens if response.usage else 0
+    prompt_tokens = response.usage.prompt_tokens if response.usage else 0
+    output_tokens = response.usage.completion_tokens if response.usage else 0
+    # 输入里命中缓存的 token 数。这是 DeepSeek 自己加的字段，不是 OpenAI 的标准字段，openai 库没有定义它，
+    # 所以用 getattr 取，取不到就当作 0（全部按没命中缓存的价格算，只会算多，不会算少）
+    cache_hit = getattr(response.usage, "prompt_cache_hit_tokens", None) or 0
+    cost = chat_cost(cache_hit, prompt_tokens - cache_hit, output_tokens, datetime.now(BEIJING))
     # content 可能是 None（只调用工具时），用 or "" 兜底
-    return ChatReply(message.content or "", calls, tokens)
+    return ChatReply(message.content or "", calls, tokens, prompt_tokens, cost)
 
 
 # 重排序：给每段文字和问题的相关程度打分（0-1），返回的分数和输入的顺序一一对应。

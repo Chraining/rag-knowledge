@@ -16,6 +16,8 @@ import json
 import re
 # dataclass：定义只装数据的小类
 from dataclasses import dataclass
+# Decimal：费用用精确的十进制小数
+from decimal import Decimal
 
 # Session：数据库会话的类型
 from sqlalchemy.orm import Session
@@ -105,6 +107,7 @@ CITATION = re.compile(r"\[([\d,，\s]+)\]")
 class AgentResult:
     answer: str  # 回答
     tokens: int  # 所有轮次加起来消耗的 token 数
+    cost: Decimal  # 所有轮次加起来的费用（元）
     sources: list[RetrievedChunk]  # 回答里实际引用了的段落
 
 
@@ -127,10 +130,12 @@ class Agent:
         # 最后是这次的问题
         messages.append({"role": "user", "content": question})
         tokens = 0
+        cost = Decimal(0)
         # 前 MAX_ROUNDS 次允许调用工具，最后一次（round_no == MAX_ROUNDS）强制回答
         for round_no in range(MAX_ROUNDS + 1):
             reply = llm.chat(messages, TOOLS, allow_tools=round_no < MAX_ROUNDS)
             tokens += reply.tokens
+            cost += reply.cost
             # 没有调用工具：这就是最终回答
             if not reply.tool_calls:
                 break
@@ -151,7 +156,7 @@ class Agent:
             # 结束当前的只读事务，把数据库连接还给连接池。
             # 原因：下一次调用大模型可能要十几秒，这期间不能一直占着连接（"idle in transaction"）
             self.db.commit()
-        return AgentResult(reply.content, tokens, self.cited(reply.content))
+        return AgentResult(reply.content, tokens, cost, self.cited(reply.content))
 
     # 执行模型要求的工具，返回给模型看的文字结果。
     # 参数是模型生成的，可能格式不对、缺字段；出错时不抛异常，而是把错误告诉模型，让它改正后重试

@@ -283,7 +283,8 @@
       for (const m of messages) {
         // 历史消息里的来源只有 document_id，用 filenames 换成文件名（文档被删了就显示编号）
         const sources = (m.sources || []).map((s) => filenames[s.document_id] || `文档 #${s.document_id}`);
-        addMessage(m.role, m.content, sources);
+        // 记录费用之前的回答没有费用（cost 为 null），不显示用量
+        addMessage(m.role, m.content, sources, m.cost === null ? "" : usage(m.tokens_used, m.cost));
       }
       // 刷新列表，让当前会话加粗
       await loadConversations();
@@ -314,7 +315,12 @@
         // 记住会话 id，下一次提问就是追问
         conversationId = data.conversation_id;
         // 显示回答和来源（文件名 + 相似度；通读文档得到的来源没有相似度，只显示文件名）
-        addMessage("assistant", data.answer, data.sources.map((s) => (s.score === null ? s.filename : `${s.filename}（${s.score}）`)));
+        addMessage(
+          "assistant",
+          data.answer,
+          data.sources.map((s) => (s.score === null ? s.filename : `${s.filename}（${s.score}）`)),
+          usage(data.tokens, data.cost)
+        );
         // 刷新会话列表（新会话会出现在最上面）
         await loadConversations();
       } catch (e) {
@@ -326,8 +332,13 @@
       }
     }
 
-    // 在聊天区加一条消息。role 是 "user" 或 "assistant"；sources 是来源文字的列表
-    function addMessage(role, text, sources) {
+    // 一次问答的用量文字，例如 "本次用量：2660 token，¥0.0053"
+    function usage(tokens, cost) {
+      return `本次用量：${tokens} token，¥${cost.toFixed(4)}`;
+    }
+
+    // 在聊天区加一条消息。role 是 "user" 或 "assistant"；sources 是来源文字的列表；usageText 是用量文字（可以不传）
+    function addMessage(role, text, sources, usageText = "") {
       const div = document.createElement("div");
       div.className = "msg " + role;
       // 同样用 textContent，防止回答内容被当成 HTML 执行
@@ -337,6 +348,13 @@
         s.className = "sources";
         s.textContent = "来源：" + sources.join("，");
         div.appendChild(s);
+      }
+      if (usageText) {
+        const u = document.createElement("div");
+        // 和来源用同样的小号灰色字
+        u.className = "sources";
+        u.textContent = usageText;
+        div.appendChild(u);
       }
       $("messages").appendChild(div);
       // 滚动到最底部，让最新消息可见
