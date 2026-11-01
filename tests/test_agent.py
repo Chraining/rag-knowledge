@@ -11,7 +11,7 @@ from sqlalchemy import select
 # 被测试的模块
 from app import agent, llm
 # 模型
-from app.models import User
+from app.models import Message, MessageRole, User
 # 复用问答测试里的辅助函数：上传并处理文档、提问
 from tests.test_chat import add_ready_doc, ask
 
@@ -88,14 +88,14 @@ def test_bad_tool_calls_are_reported_to_the_model(db, make_user, name, arguments
 # ============================ 循环 ============================
 
 
-# 测试：打招呼时模型不调用工具，直接回答，只调用一次模型，没有来源
-def test_answer_without_tools(client, register_and_login, fake_llm):
+# 测试：打招呼时第 1 次也必须调用工具（按提示词用 list_documents），第 2 次回答，没有来源
+def test_greeting_still_calls_a_tool(client, register_and_login, fake_llm):
     headers = register_and_login("alice")
-    fake_llm.script = [answer("你好！")]
+    fake_llm.script = [tool_call("list_documents"), answer("你好！")]
     r = ask(client, headers, "你好")
     assert r.json()["answer"] == "你好！"
     assert r.json()["sources"] == []
-    assert len(fake_llm.chat_calls) == 1
+    assert len(fake_llm.chat_calls) == 2
 
 
 # 测试："我有几个文件"这类问题：模型调用 list_documents，拿到的是文件列表，而不是检索出来的段落
@@ -109,20 +109,20 @@ def test_list_documents_answers_file_questions(client, db, register_and_login, e
     assert "共 2 个文档" in tool_result and "a.md" in tool_result and "b.md" in tool_result
 
 
-# 测试：模型一直要调用工具也会停：最多 MAX_ROUNDS 轮工具，最后一次不许再调用工具，必须回答
+# 测试：模型一直要调用工具也会停：第 1 次必须调用工具，最多 MAX_ROUNDS 轮工具，最后一次不许再调用工具，必须回答
 def test_loop_stops_after_max_rounds(client, register_and_login, monkeypatch):
     headers = register_and_login("alice")
-    # 记录每次调用时是否允许调用工具
-    allowed: list[bool] = []
+    # 记录每次调用时的 tool_choice
+    choices: list[str] = []
 
     # 一个"停不下来"的模型：只要允许，就一直调用工具
-    def endless(messages, tools=None, allow_tools=True):
-        allowed.append(allow_tools)
-        return tool_call("list_documents") if allow_tools else answer("final")
+    def endless(messages, tools=None, tool_choice="auto"):
+        choices.append(tool_choice)
+        return answer("final") if tool_choice == "none" else tool_call("list_documents")
 
     monkeypatch.setattr(llm, "chat", endless)
     assert ask(client, headers, "loop").json()["answer"] == "final"
-    assert allowed == [True] * agent.MAX_ROUNDS + [False]
+    assert choices == ["required"] + ["auto"] * (agent.MAX_ROUNDS - 1) + ["none"]
 
 
 # ============================ 引用 ============================
@@ -151,3 +151,37 @@ def test_read_document_sources_have_no_score(client, db, register_and_login, enq
     fake_llm.script = [tool_call("read_document", document_id=doc_id), answer("summary [1]")]
     source = ask(client, headers, "summarize a.md").json()["sources"][0]
     assert source["filename"] == "a.md" and source["score"] is None
+
+
+# ============================ 历史 ============================
+
+
+# 构造一段历史：每条消息的字数依次是 lengths 里的数，用户和助手交替
+def make_history(*lengths: int) -> list[Message]:
+    roles = [MessageRole.USER, MessageRole.ASSISTANT]
+    return [Message(role=roles[i % 2], content="字" * n) for i, n in enumerate(lengths)]
+
+
+# 测试：预算够的时候，全部历史都带上（不再固定只带最近 6 条）
+def test_history_keeps_everything_within_budget():
+    history = make_history(*[10] * 20)
+    assert agent.recent_history(history) == history
+
+
+# 测试：超出预算时，丢掉最早的消息，保留最近的
+def test_history_drops_oldest_beyond_budget(monkeypatch):
+    monkeypatch.setattr(agent, "HISTORY_TOKEN_BUDGET", 100)
+    # 每条 100 字 ≈ 62 token：最近 1 条 62，2 条 124 已经超出预算，但最后一组问答一定保留
+    history = make_history(100, 100, 100, 100)
+    assert agent.recent_history(history) == history[-2:]
+    # 每条 50 字 ≈ 31 token：最近 3 条 93 没有超出，4 条 124 超出
+    history = make_history(50, 50, 50, 50, 50)
+    assert agent.recent_history(history) == history[-3:]
+
+
+# 测试：最后一组问答一定保留，哪怕一条就超出了预算；新会话没有历史
+def test_history_always_keeps_last_pair(monkeypatch):
+    monkeypatch.setattr(agent, "HISTORY_TOKEN_BUDGET", 10)
+    history = make_history(5, 1000, 1000, 1000)
+    assert agent.recent_history(history) == history[-2:]
+    assert agent.recent_history([]) == []

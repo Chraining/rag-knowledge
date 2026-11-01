@@ -11,7 +11,7 @@
 接口只告诉我们总的 token 数，不会按部分拆分，所以各部分按字数统计，再用"总 token ÷ 总字数"换算成大约的 token 数。
 
 第 1 轮给回答提了一个格式要求，之后每轮检查回答是否还遵守，最后一轮直接问"我一开始提了什么要求"：
-看历史窗口（agent.HISTORY_MESSAGES）把第 1 轮挤出去之后，模型还记不记得。
+看历史预算（agent.HISTORY_TOKEN_BUDGET）把第 1 轮挤出去之后，模型还记不记得。
 对话历史只放在内存里，不写数据库。
 """
 
@@ -32,7 +32,7 @@ from scripts.evaluate import prepare_database
 
 # 回放的对话。包含：追问（"那……呢""它"）、需要通读文件的问题（read_document）、对比两个文件（多次调用工具）
 CONVERSATION = [
-    "接下来我问的问题，回答都控制在两句话以内，并且在最后加上“（来自知识库）”。",
+    "接下来我问的问题，回答都在最后加上“（来自知识库）”。",
     "我是 P7，去上海出差住酒店一晚能报多少？",
     "那吃饭呢？",
     "三个多月前的发票还能报销吗？",
@@ -87,8 +87,8 @@ def main() -> None:
 
     # 包一层：照常调用真实的接口，顺便记录发送的消息和输入 token 数。
     # Agent 里写的是 llm.chat(...)，每次调用时才去 llm 模块里取这个函数，所以替换模块上的属性就能生效
-    def recording_chat(messages: list[dict], tools: list[dict] | None = None, allow_tools: bool = True) -> llm.ChatReply:
-        reply = real_chat(messages, tools, allow_tools)
+    def recording_chat(messages: list[dict], tools: list[dict] | None = None, tool_choice: str = "auto") -> llm.ChatReply:
+        reply = real_chat(messages, tools, tool_choice)
         calls.append((section_chars(messages, history_len), reply.prompt_tokens))
         return reply
 
@@ -101,16 +101,16 @@ def main() -> None:
             raise SystemExit("评测库里没有自建评测集，先运行：uv run python -m scripts.evaluate")
 
         history: list[Message] = []
-        print(f"历史窗口：最近 {agent.HISTORY_MESSAGES} 条消息；表中字数是本轮最后一次调用（提示词最长的一次）的")
+        print(f"历史预算：{agent.HISTORY_TOKEN_BUDGET} token；表中字数是本轮最后一次调用（提示词最长的一次）的")
         print(f"{'轮次':>4} {'调用':>4} {'输入token':>9} " + " ".join(f"{s:>6}" for s in SECTIONS) + f" {'窗口外':>6}  遵守  回答")
         for turn, question in enumerate(CONVERSATION, start=1):
             first_call = len(calls)
-            history_len = min(len(history), agent.HISTORY_MESSAGES)
+            history_len = len(agent.recent_history(history))
             result = agent.Agent(db, user_id).run(question, history)
             turn_calls = calls[first_call:]
             chars, _ = turn_calls[-1]
             # 被窗口挤掉、模型已经看不到的历史字数
-            dropped = size([{"content": m.content} for m in history[: -agent.HISTORY_MESSAGES]])
+            dropped = size([{"content": m.content} for m in history[: len(history) - history_len]])
             # 第 1 轮是提要求本身，不检查
             followed = "" if turn == 1 else ("✓" if MARKER in result.answer[-20:] else "✗")
             print(

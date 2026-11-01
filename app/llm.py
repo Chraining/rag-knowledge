@@ -122,13 +122,13 @@ def chat_cost(cache_hit: int, cache_miss: int, output: int, at: datetime) -> Dec
 # 让大模型根据对话消息生成回复。
 # messages 的格式：[{"role": "system"/"user"/"assistant"/"tool", "content": "..."}, ...]
 # tools：可供模型调用的工具说明（OpenAI 的 function calling 格式），不传就是普通对话。
-# allow_tools=False：工具说明照样发送（对话里已经有工具调用记录，去掉说明有的服务会报错），
-#   但要求模型这次必须直接回答，不能再调用工具
-def chat(messages: list[dict], tools: list[dict] | None = None, allow_tools: bool = True) -> ChatReply:
+# tool_choice：这次能不能调用工具。
+#   "auto"：模型自己决定调不调用；"required"：必须调用至少一个工具（调用哪个由模型选）；
+#   "none"：不许调用，必须直接回答。工具说明照样发送（对话里已经有工具调用记录，去掉说明有的服务会报错）
+def chat(messages: list[dict], tools: list[dict] | None = None, tool_choice: str = "auto") -> ChatReply:
     # 回答用 DeepSeek
     client = _client(settings.deepseek_api_key, settings.chat_base_url, "DEEPSEEK_API_KEY")
-    # tool_choice="auto"：模型自己决定调不调用工具；"none"：不许调用
-    extra = {"tools": tools, "tool_choice": "auto" if allow_tools else "none"} if tools else {}
+    extra = {"tools": tools, "tool_choice": tool_choice} if tools else {}
     try:
         response = client.chat.completions.create(model=settings.chat_model, messages=messages, **extra)
     except OpenAIError as e:

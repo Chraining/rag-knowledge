@@ -170,7 +170,7 @@ class FakeLLM:
     # 默认行为模拟一个"最简单的 Agent"：
     #   第 1 轮：用用户的问题调用一次 search_documents
     #   第 2 轮：回答 "fake answer"，并引用检索结果里的所有编号（例如 "fake answer [1][2]"）
-    def chat(self, messages: list[dict], tools: list[dict] | None = None, allow_tools: bool = True) -> llm.ChatReply:
+    def chat(self, messages: list[dict], tools: list[dict] | None = None, tool_choice: str = "auto") -> llm.ChatReply:
         if self.fail:
             raise llm.LLMUnavailable("fake outage")
         self.chat_calls.append(list(messages))
