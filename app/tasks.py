@@ -5,12 +5,17 @@
 # get_task_logger：Celery 提供的日志工具，日志里会自动带上任务名和任务 id
 from celery.utils.log import get_task_logger
 
-# 处理逻辑
-from app import processing
+# update：按条件更新会话的摘要
+from sqlalchemy import update
+
+# 处理逻辑；llm：摘要时外部服务失败的错误类型；queries：取会话的消息；summary：摘要逻辑
+from app import llm, processing, queries, summary
 # Celery 应用
 from app.celery_app import celery_app
 # 会话工厂：worker 是独立的进程，不经过 FastAPI，所以要自己创建数据库会话
 from app.db import SessionLocal
+# 模型
+from app.models import Conversation, UsageAction, UsageLog
 
 # 日志对象
 logger = get_task_logger(__name__)
@@ -61,3 +66,47 @@ def process_document(self, document_id: int) -> None:
         # self.retry 会重新投递这个任务（countdown 秒后执行），然后抛出一个特殊的 Retry 异常结束本次执行。
         # 前面加 raise 是 Celery 推荐的写法，让代码读起来更清楚"这里结束了"
         raise self.retry(exc=e, countdown=countdown)
+
+
+# 给一个会话做摘要：把最早的一部分还没被摘要的消息，合并进会话的摘要（见 app/summary.py）。
+# 由问答接口在历史超出预算后投递。不重试：失败了（比如大模型接口超时）也没关系，
+# 历史仍然超出预算，下一次提问时会再投递一次；在那之前，提问时最早的消息暂时按预算被丢掉
+@celery_app.task
+def summarize_conversation(conversation_id: int) -> None:
+    with SessionLocal() as db:
+        conversation = db.get(Conversation, conversation_id)
+        # 会话可能在排队期间被删掉了
+        if conversation is None:
+            return
+        old_count = conversation.summarized_count
+        unsummarized = queries.list_messages(db, conversation.user_id, conversation_id)[old_count:]
+        fold = summary.messages_to_fold(unsummarized)
+        # 已经被别的任务摘要过了，或者还没超出预算
+        if fold == 0:
+            return
+        old_summary, user_id = conversation.summary, conversation.user_id
+        # 调用大模型可能要十几秒，先结束只读事务，把数据库连接还给连接池。
+        # 结束之前先把对象移出会话（expunge）：commit 默认会让会话里的对象"过期"，
+        # 之后再读 m.content 又会去查数据库、开一个新事务，在调用大模型期间一直占着连接
+        db.expunge_all()
+        db.commit()
+        try:
+            reply = summary.summarize(old_summary, unsummarized[:fold])
+        except llm.LLMUnavailable:
+            logger.warning("summary of conversation %s failed, will retry on the next question", conversation_id, exc_info=True)
+            return
+        # 只在 summarized_count 还是开始时的值时才更新（"比较后再写入"）：
+        # 同一个会话可能同时有两个摘要任务（用户连着问了两个问题），先写入的生效，
+        # 后写入的发现 summarized_count 已经变了，就放弃，不会用基于旧数据算出的摘要覆盖新的
+        updated = db.execute(
+            update(Conversation)
+            .where(Conversation.id == conversation_id, Conversation.summarized_count == old_count)
+            .values(summary=reply.content, summarized_count=old_count + fold)
+        ).rowcount
+        # 不管有没有用上，这次调用的钱都花了，都要记录
+        db.add(UsageLog(user_id=user_id, action=UsageAction.SUMMARY, tokens_used=reply.tokens, cost=reply.cost))
+        db.commit()
+        if updated:
+            logger.info("conversation %s: summarized %s more messages", conversation_id, fold)
+        else:
+            logger.info("conversation %s: summary skipped, another task got there first", conversation_id)

@@ -71,6 +71,7 @@ class MessageRole(enum.StrEnum):
 class UsageAction(enum.StrEnum):
     UPLOAD = "upload"  # 上传了一个文档
     QUERY = "query"  # 提了一个问题
+    SUMMARY = "summary"  # 后台给一个会话做了一次摘要（见 app/summary.py），不算进每日提问配额
 
 
 # 辅助函数：把 Python 枚举转换成数据库列类型。前面的下划线表示"仅本文件内部使用"。
@@ -248,6 +249,11 @@ class Conversation(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
     # 会话标题（计划从第一个问题自动生成）
     title: Mapped[str] = mapped_column(String(200))
+    # 更早的消息的摘要（见 app/summary.py）。为空：历史还没长到需要摘要
+    summary: Mapped[str | None] = mapped_column(Text)
+    # 摘要已经包含了最早的多少条消息。提问时只把这之后的消息作为历史发给模型，前面的用摘要代替。
+    # 存条数而不是最后一条的 id：消息按 (created_at, id) 排序，条数和这个顺序直接对应
+    summarized_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     # 创建时间
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     # 最后更新时间

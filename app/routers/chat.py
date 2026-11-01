@@ -3,6 +3,7 @@
 #   2. 扣配额（Redis 计数器，超了返回 429）
 #   3. 交给 Agent：大模型自己决定调用哪些工具（检索、列出文档、读取文档），再生成回答（见 agent.py）
 #   4. 在一个事务里保存：会话、提问、回答、使用记录
+#   5. 历史太长时，投递后台任务，把最早的消息压缩成摘要（见 app/summary.py）
 # 外部服务失败时（embedding 或 LLM 挂了）：退还配额，什么都不保存，返回 503 友好提示，而不是 500
 
 # logging：记录日志
@@ -14,13 +15,15 @@ from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import func
 
 # 各个模块
-from app import agent, llm, queries, quota
+from app import agent, llm, queries, quota, summary
 # 依赖：当前用户、数据库会话
 from app.deps import CurrentUser, DbSession
 # 模型
 from app.models import Conversation, Message, MessageRole, UsageAction, UsageLog
 # 请求和响应的数据结构
 from app.schemas import ChatRequest, ChatResponse, SourceOut
+# 后台摘要任务
+from app.tasks import summarize_conversation
 
 # 日志对象
 logger = logging.getLogger(__name__)
@@ -57,13 +60,14 @@ def chat(body: ChatRequest, user: CurrentUser, db: DbSession) -> ChatResponse:
     # answered 记录是否成功拿到了回答。用 try/finally 保证：只要中途失败（不管什么原因），都退还配额
     answered = False
     try:
-        # 历史消息（新会话没有历史）
-        history = queries.list_messages(db, user.id, conversation.id) if conversation else []
+        # 还没被摘要的历史消息（新会话没有历史）。更早的消息由摘要代替（见 app/summary.py）
+        history = queries.list_messages(db, user.id, conversation.id)[conversation.summarized_count :] if conversation else []
+        conversation_summary = conversation.summary if conversation else None
         # 结束当前的只读事务，把数据库连接还给连接池。
         # 原因：下面调用 LLM 可能要十几秒，这期间如果一直占着连接（"idle in transaction"），
         # 并发一高，连接池很快就被占满，其他所有接口都要排队等连接
         db.commit()
-        result = agent.Agent(db, user.id).run(body.question, history)
+        result = agent.Agent(db, user.id).run(body.question, history, conversation_summary)
         answered = True
     except llm.LLMUnavailable:
         # 外部服务失败（超时、重试后仍失败、没配 key 等）：记录详细原因，给用户一个友好的提示
@@ -88,23 +92,33 @@ def chat(body: ChatRequest, user: CurrentUser, db: DbSession) -> ChatResponse:
     # clock_timestamp() 是真实的当前时间（和 messages.created_at 用的一样，原因见 models.py）
     conversation.updated_at = func.clock_timestamp()
     # 提问
-    db.add(Message(conversation=conversation, role=MessageRole.USER, content=body.question))
+    question = Message(conversation=conversation, role=MessageRole.USER, content=body.question)
     # 回答，带上引用来源（存 JSON）
     sources = [{"chunk_id": c.chunk_id, "document_id": c.document_id, "score": _round(c.score)} for c in result.sources]
-    db.add(
-        Message(
-            conversation=conversation,
-            role=MessageRole.ASSISTANT,
-            content=result.answer,
-            sources=sources,
-            tokens_used=result.tokens,
-            cost=result.cost,
-        )
+    answer = Message(
+        conversation=conversation,
+        role=MessageRole.ASSISTANT,
+        content=result.answer,
+        sources=sources,
+        tokens_used=result.tokens,
+        cost=result.cost,
     )
+    db.add_all([question, answer])
     # 使用记录：Redis 不可用时，配额就靠数这张表；同时也是统计用量和费用的依据
     db.add(UsageLog(user_id=user.id, action=UsageAction.QUERY, tokens_used=result.tokens, cost=result.cost))
+    # 加上这一问一答之后，还没被摘要的历史是否超出了预算
+    needs_summary = summary.messages_to_fold(history + [question, answer]) > 0
     # 四种写入在同一个事务里，要么全部成功，要么全部不生效
     db.commit()
+
+    # ---------- 第 5 步：历史太长时，投递后台摘要任务 ----------
+    # 放在 commit 之后：否则 worker 可能在事务提交前就去查消息，查不到这一问一答
+    if needs_summary:
+        try:
+            summarize_conversation.delay(conversation.id)
+        except Exception:
+            # 投递失败（比如 Redis 挂了）不影响这次回答。历史仍然超出预算，下次提问会再投递
+            logger.exception("failed to enqueue summary of conversation %s", conversation.id)
 
     return ChatResponse(
         conversation_id=conversation.id,

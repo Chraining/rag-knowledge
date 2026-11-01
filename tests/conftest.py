@@ -137,6 +137,19 @@ def enqueued(monkeypatch):
     return calls
 
 
+# autouse=True：和上面一样，把问答接口里的"投递摘要任务"换成"记到一个列表里"。
+# 测试里写参数 summaries_enqueued 就能拿到这个列表（被投递的会话 id）
+@pytest.fixture(autouse=True)
+def summaries_enqueued(monkeypatch):
+    calls: list[int] = []
+
+    class FakeTask:
+        delay = staticmethod(calls.append)
+
+    monkeypatch.setattr("app.routers.chat.summarize_conversation", FakeTask)
+    return calls
+
+
 # 假的 embedding：把文字里的每个单词"哈希"到 1024 维中的某一维上，在那一维上加 1。
 # 效果：包含相同单词的文字，向量方向接近，余弦相似度高。足够测试"检索能找到相关段落"，而且结果固定、不花钱
 def fake_embedding(text: str) -> list[float]:
