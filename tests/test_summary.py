@@ -58,9 +58,19 @@ def test_summarize_merges_old_summary(fake_llm):
     messages = [Message(role=MessageRole.USER, content="只用中文回答"), Message(role=MessageRole.ASSISTANT, content="好的")]
     assert summary.summarize("旧摘要", messages).content == "新摘要"
     system, user = fake_llm.chat_calls[0]
-    assert system["content"] == summary.SUMMARY_PROMPT
+    assert system["content"] == summary.SUMMARY_PROMPT.format(max_chars=summary.max_chars())
     assert "旧摘要" in user["content"]
     assert "用户：只用中文回答" in user["content"] and "助手：好的" in user["content"]
+
+
+# 测试：摘要的长度上限随历史预算变化（预算的 1/8，换算成字数），并写进发给模型的提示词
+def test_summary_limit_scales_with_budget(fake_llm, monkeypatch):
+    # 6000 token × 1/8 = 750 token，÷ 0.62 ≈ 1210 字
+    assert summary.max_chars() == 1210
+    monkeypatch.setattr(agent, "HISTORY_TOKEN_BUDGET", 12000)
+    assert summary.max_chars() == 2419
+    summary.summarize(None, [Message(role=MessageRole.USER, content="你好")])
+    assert "整份摘要不超过 2419 字" in fake_llm.chat_calls[0][0]["content"]
 
 
 # ============================ 问答接口 ============================
